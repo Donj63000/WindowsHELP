@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+
+# JetBrains IDE files
+/.idea/
+/*.iml
+
+# Local OS/editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.log
+*.tmp
+*.temp
+
+# Local archive generated for sharing
+/Projet.zip

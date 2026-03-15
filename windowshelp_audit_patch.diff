@@ -1,0 +1,209 @@
+diff -ruN projet/src/app.rs projet_fixed/src/app.rs
+--- projet/src/app.rs	2026-03-14 22:40:11.000000000 +0000
++++ projet_fixed/src/app.rs	2026-03-15 02:18:24.860302206 +0000
+@@ -227,7 +227,7 @@
+     fn refresh_search_results(&mut self) {
+         let search_status = self.search_service.status();
+         let fingerprint = format!(
+-            "{}|{}|{}|{}|{}|{}|{}|{:?}",
++            "{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
+             self.search_text,
+             self.extension_filter,
+             self.min_size_filter,
+@@ -235,7 +235,8 @@
+             self.modified_after_filter,
+             self.modified_before_filter,
+             self.include_hidden_results,
+-            search_status.last_scan_completed
++            search_status.snapshot_revision,
++            search_status.last_scan_completed,
+         );
+         if fingerprint == self.last_search_fingerprint {
+             return;
+@@ -1299,6 +1300,10 @@
+     }
+ }
+ impl eframe::App for WindowsHelpApp {
++    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
++        theme::BG_GRAPHITE.to_normalized_gamma_f32()
++    }
++
+     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+         ctx.request_repaint_after(Duration::from_millis(250));
+         theme::paint_app_background(ctx);
+@@ -1431,7 +1436,8 @@
+     let native_options = eframe::NativeOptions {
+         viewport: egui::ViewportBuilder::default()
+             .with_inner_size([1500.0, 920.0])
+-            .with_min_inner_size([1200.0, 760.0]),
++            .with_min_inner_size([1200.0, 760.0])
++            .with_transparent(false),
+         ..Default::default()
+     };
+ 
+diff -ruN projet/src/search.rs projet_fixed/src/search.rs
+--- projet/src/search.rs	2026-03-13 00:41:50.000000000 +0000
++++ projet_fixed/src/search.rs	2026-03-15 02:19:28.759344646 +0000
+@@ -78,6 +78,7 @@
+     pub last_error: Option<String>,
+     pub indexed_entries: usize,
+     pub watched_roots: usize,
++    pub snapshot_revision: u64,
+ }
+ 
+ pub struct SearchService {
+@@ -165,8 +166,10 @@
+                             *snapshot_guard = items.clone();
+                         }
+                         if let Ok(mut status_guard) = status.lock() {
+-                            status_guard.indexed_entries = indexed_entries.max(items.len());
++                            status_guard.indexed_entries = items.len();
+                             status_guard.last_scan_completed = Some(Utc::now().timestamp());
++                            status_guard.snapshot_revision =
++                                status_guard.snapshot_revision.wrapping_add(1);
+                             status_guard.is_indexing = false;
+                         }
+                     }
+@@ -195,12 +198,10 @@
+     }
+ 
+     pub fn search(&self, query: &SearchQuery, limit: usize) -> Vec<SearchResult> {
+-        let snapshot = self
+-            .snapshot
++        self.snapshot
+             .read()
+-            .map(|guard| guard.clone())
+-            .unwrap_or_default();
+-        search_snapshot(&snapshot, query, limit)
++            .map(|guard| search_snapshot(&guard, query, limit))
++            .unwrap_or_default()
+     }
+ 
+     pub fn status(&self) -> IndexStatus {
+@@ -301,6 +302,9 @@
+                                     }
+                                     if let Ok(mut status_guard) = status.lock() {
+                                         status_guard.indexed_entries = items.len();
++                                        status_guard.snapshot_revision =
++                                            status_guard.snapshot_revision.wrapping_add(1);
++                                        status_guard.last_error = None;
+                                     }
+                                 }
+                                 Err(error) => {
+@@ -357,7 +361,12 @@
+ }
+ 
+ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
+-    Connection::open(path).with_context(|| format!("échec de l'ouverture de {}", path.display()))
++    let connection = Connection::open(path)
++        .with_context(|| format!("échec de l'ouverture de {}", path.display()))?;
++    connection
++        .busy_timeout(Duration::from_secs(2))
++        .context("échec de la configuration du délai SQLite")?;
++    Ok(connection)
+ }
+ 
+ pub fn full_scan(config: &IndexConfig) -> anyhow::Result<usize> {
+@@ -571,9 +580,10 @@
+     connection: &Connection,
+     prefix: &str,
+ ) -> anyhow::Result<HashSet<String>> {
+-    let mut statement =
+-        connection.prepare("SELECT path FROM file_index WHERE path = ?1 OR path LIKE ?2")?;
+-    let like = format!("{prefix}%");
++    let mut statement = connection.prepare(
++        "SELECT path FROM file_index WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
++    )?;
++    let like = child_prefix_like(prefix);
+     let rows = statement.query_map(params![prefix, like], |row| row.get::<_, String>(0))?;
+ 
+     let mut values = HashSet::new();
+@@ -600,9 +610,9 @@
+ 
+ fn remove_path_prefix(connection: &Connection, path: &Path) -> anyhow::Result<()> {
+     let prefix = normalized_path_string(path);
+-    let like = format!("{prefix}%");
++    let like = child_prefix_like(&prefix);
+     connection.execute(
+-        "DELETE FROM file_index WHERE path = ?1 OR path LIKE ?2",
++        "DELETE FROM file_index WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
+         params![prefix, like],
+     )?;
+     Ok(())
+@@ -818,6 +828,19 @@
+         .map(|duration| duration.as_secs() as i64)
+ }
+ 
++fn child_prefix_like(prefix: &str) -> String {
++    let escaped = prefix
++        .replace('\\', "\\\\")
++        .replace('%', "\\%")
++        .replace('_', "\\_");
++    if prefix.ends_with('\\') {
++        format!("{escaped}%")
++    } else {
++        format!("{escaped}\\\\%")
++    }
++}
++
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -883,6 +906,41 @@
+     }
+ 
+     #[test]
++    fn prefix_matching_respects_directory_boundaries() -> anyhow::Result<()> {
++        let temp = tempdir()?;
++        let db_path = temp.path().join("index.db");
++        initialize_database(&db_path)?;
++        let mut connection = open_connection(&db_path)?;
++        let transaction = connection.transaction()?;
++        {
++            let mut statement = transaction.prepare(
++                "
++                INSERT INTO file_index (
++                    path, name, path_lower, name_lower, extension, is_dir, size_bytes,
++                    created_at, modified_at, accessed_at, attributes
++                )
++                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
++                ",
++            )?;
++
++            for entry in [
++                sample_entry("alpha.txt", r"C:\Users\alpha.txt"),
++                sample_entry("beta.txt", r"C:\Users\team\beta.txt"),
++                sample_entry("wrong.txt", r"C:\Users2\wrong.txt"),
++            ] {
++                upsert_entry(&mut statement, &entry)?;
++            }
++        }
++        transaction.commit()?;
++
++        let matches = existing_paths_under_prefix(&connection, r"C:\Users")?;
++        assert!(matches.contains(r"C:\Users\alpha.txt"));
++        assert!(matches.contains(r"C:\Users\team\beta.txt"));
++        assert!(!matches.contains(r"C:\Users2\wrong.txt"));
++        Ok(())
++    }
++
++    #[test]
+     fn full_scan_builds_db_and_sync_updates_it() -> anyhow::Result<()> {
+         let temp = tempdir()?;
+         let root = temp.path().join("scan-root");
+diff -ruN projet/src/thermal.rs projet_fixed/src/thermal.rs
+--- projet/src/thermal.rs	2026-03-14 20:07:19.000000000 +0000
++++ projet_fixed/src/thermal.rs	2026-03-15 02:18:24.862649513 +0000
+@@ -580,6 +580,11 @@
+             .flatten()
+             .and_then(|value| value.get("mode").and_then(Value::as_i64))
+             .map(|value| value as i32);
++
++        if fan_control.is_none() && operating_mode.is_none() {
++            return None;
++        }
++
+         Some(CapturedControlState::AcerNitro {
+             fan_control,
+             operating_mode,

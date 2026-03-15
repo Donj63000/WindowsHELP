@@ -1,0 +1,27 @@
+[package]
+name = "WindowsHELP"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "windows_help"
+
+[dependencies]
+anyhow = "1.0.100"
+chrono = { version = "0.4.44", features = ["serde"] }
+directories = "6.0.0"
+eframe = "0.33.3"
+notify = "9.0.0-rc.2"
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sysinfo = "0.38.4"
+tempfile = "3.23.0"
+tokio = { version = "1.50.0", features = ["rt-multi-thread", "sync", "time"] }
+walkdir = "2.5.0"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+] }
