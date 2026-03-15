@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, anyhow};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+};
 use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -16,8 +18,13 @@ use windows::Win32::System::Threading::{
     HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, OpenProcess,
     PROCESS_ACCESS_RIGHTS, PROCESS_CREATION_FLAGS, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SET_INFORMATION, PROCESS_TERMINATE, SetPriorityClass, TerminateProcess,
+    WaitForSingleObject,
 };
-use windows::core::PCWSTR;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
+    WM_CLOSE,
+};
+use windows::core::{BOOL, PCWSTR};
 
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
@@ -51,6 +58,10 @@ impl PriorityClass {
             Self::AboveNormal,
             Self::High,
         ]
+    }
+
+    pub fn recommended_choices() -> [Self; 3] {
+        [Self::Idle, Self::BelowNormal, Self::Normal]
     }
 
     fn to_windows(self) -> u32 {
@@ -157,13 +168,13 @@ pub fn show_toast_notification(title: &str, body: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn with_process_handle<F>(
+fn with_process_handle<T, F>(
     pid: u32,
     desired_access: PROCESS_ACCESS_RIGHTS,
     callback: F,
-) -> anyhow::Result<()>
+) -> anyhow::Result<T>
 where
-    F: FnOnce(HANDLE) -> anyhow::Result<()>,
+    F: FnOnce(HANDLE) -> anyhow::Result<T>,
 {
     // SAFETY: OpenProcess is called with a valid pid value and the resulting handle is closed.
     let handle = unsafe { OpenProcess(desired_access, false, pid) }
@@ -239,6 +250,112 @@ pub fn collect_thread_counts() -> anyhow::Result<HashMap<u32, u32>> {
         let _ = CloseHandle(snapshot);
     }
     Ok(counts)
+}
+
+pub fn has_visible_window(pid: u32) -> anyhow::Result<bool> {
+    Ok(collect_visible_window_pids()?.contains(&pid))
+}
+
+pub fn collect_visible_window_pids() -> anyhow::Result<HashSet<u32>> {
+    let mut context = WindowPidCollector {
+        target_pid: None,
+        pids: HashSet::new(),
+        closed_windows: 0,
+        error: None,
+        send_close: false,
+    };
+    enum_windows(&mut context)?;
+    Ok(context.pids)
+}
+
+pub fn close_process_gracefully(pid: u32) -> anyhow::Result<()> {
+    let mut context = WindowPidCollector {
+        target_pid: Some(pid),
+        pids: HashSet::new(),
+        closed_windows: 0,
+        error: None,
+        send_close: true,
+    };
+    enum_windows(&mut context)?;
+    if let Some(error) = context.error {
+        return Err(anyhow!(error));
+    }
+    if context.closed_windows == 0 {
+        anyhow::bail!("aucune fenetre visible n'a ete trouvee pour le processus {pid}");
+    }
+    Ok(())
+}
+
+pub fn wait_for_process_exit(pid: u32, timeout_ms: u32) -> anyhow::Result<bool> {
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    with_process_handle(
+        pid,
+        PROCESS_ACCESS_RIGHTS(PROCESS_QUERY_LIMITED_INFORMATION.0 | SYNCHRONIZE_ACCESS),
+        |handle| {
+            let status = unsafe { WaitForSingleObject(handle, timeout_ms) };
+            if status == WAIT_OBJECT_0 {
+                Ok(true)
+            } else if status == WAIT_TIMEOUT {
+                Ok(false)
+            } else {
+                Err(anyhow!(
+                    "echec de l'attente de fermeture du processus {pid} (code {:?})",
+                    status
+                ))
+            }
+        },
+    )
+}
+
+struct WindowPidCollector {
+    target_pid: Option<u32>,
+    pids: HashSet<u32>,
+    closed_windows: usize,
+    error: Option<String>,
+    send_close: bool,
+}
+
+fn enum_windows(context: &mut WindowPidCollector) -> anyhow::Result<()> {
+    let context_ptr = context as *mut WindowPidCollector;
+    // SAFETY: context_ptr remains valid for the duration of EnumWindows.
+    unsafe { EnumWindows(Some(enum_windows_callback), LPARAM(context_ptr as isize)) }
+        .context("echec de l'enumeration des fenetres Windows")
+}
+
+unsafe extern "system" fn enum_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let context = unsafe { &mut *(lparam.0 as *mut WindowPidCollector) };
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        return true.into();
+    }
+
+    let is_top_level = unsafe { GetWindow(hwnd, GW_OWNER) }.is_err();
+    if !is_top_level {
+        return true.into();
+    }
+
+    let mut pid = 0u32;
+    unsafe {
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    if pid == 0 {
+        return true.into();
+    }
+
+    context.pids.insert(pid);
+
+    if context.send_close && context.target_pid == Some(pid) {
+        if let Err(error) = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) } {
+            if context.error.is_none() {
+                context.error = Some(format!(
+                    "impossible d'envoyer WM_CLOSE au processus {pid}: {error}"
+                ));
+            }
+        } else {
+            context.closed_windows += 1;
+        }
+    }
+
+    true.into()
 }
 
 fn escape_xml(value: &str) -> String {

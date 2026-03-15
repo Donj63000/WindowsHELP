@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +10,11 @@ use tokio::runtime::Runtime;
 use crate::config::{Settings, app_paths, load_or_create_settings, save_settings};
 use crate::monitor::{AlertEvent, AlertEventState, AlertRule, MonitorService, ProcessMetric};
 use crate::platform_windows::{PriorityClass, open_path, reveal_in_explorer};
-use crate::process::{ProcessAction, ProcessManager};
+use crate::process::{
+    ProcessAction, ProcessActionResult, ProcessBottleneck, ProcessFamily, ProcessKey,
+    ProcessManager, ProcessRecommendation, ProcessRow, ProcessSafety, ProcessState,
+    SuggestedAction,
+};
 use crate::search::{SearchQuery, SearchResult, SearchService, parse_date_filter};
 use crate::theme::{self, CardTone};
 use crate::thermal::{
@@ -52,6 +56,52 @@ impl View {
                 "Configuration persistante de l'indexation, de la surveillance et des seuils."
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessTab {
+    Families,
+    Instances,
+}
+
+impl ProcessTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Families => "Familles",
+            Self::Instances => "Instances",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessSort {
+    Impact,
+    CpuNow,
+    CpuAverage,
+    Memory,
+    Name,
+}
+
+impl ProcessSort {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Impact => "Impact",
+            Self::CpuNow => "CPU instantane",
+            Self::CpuAverage => "CPU moyen 10s",
+            Self::Memory => "Memoire",
+            Self::Name => "Nom",
+        }
+    }
+
+    fn all() -> [Self; 5] {
+        [
+            Self::Impact,
+            Self::CpuNow,
+            Self::CpuAverage,
+            Self::Memory,
+            Self::Name,
+        ]
     }
 }
 
@@ -183,7 +233,14 @@ pub struct WindowsHelpApp {
     search_results: Vec<SearchResult>,
     last_search_fingerprint: String,
     process_filter: String,
-    confirm_kill: Option<(u32, String)>,
+    selected_process: Option<ProcessKey>,
+    selected_family: Option<String>,
+    process_sort: ProcessSort,
+    process_tab: ProcessTab,
+    hide_windows_processes: bool,
+    show_only_suspects: bool,
+    show_only_closeable: bool,
+    confirm_kill: Option<(ProcessKey, String)>,
     status_message: Option<String>,
 }
 
@@ -221,6 +278,13 @@ impl WindowsHelpApp {
             search_results: Vec::new(),
             last_search_fingerprint: String::new(),
             process_filter: String::new(),
+            selected_process: None,
+            selected_family: None,
+            process_sort: ProcessSort::Impact,
+            process_tab: ProcessTab::Families,
+            hide_windows_processes: true,
+            show_only_suspects: false,
+            show_only_closeable: false,
             confirm_kill: None,
             status_message: None,
         };
@@ -282,10 +346,15 @@ impl WindowsHelpApp {
     }
 
     fn active_alerts(events: &[AlertEvent]) -> Vec<AlertEvent> {
-        let mut latest_by_source: HashMap<(String, String), AlertEvent> = HashMap::new();
+        let mut latest_by_source: HashMap<(String, Option<u32>, String), AlertEvent> =
+            HashMap::new();
         for event in events {
             latest_by_source.insert(
-                (event.rule_id.clone(), event.source_label.clone()),
+                (
+                    event.rule_id.clone(),
+                    event.source_pid,
+                    event.source_label.clone(),
+                ),
                 event.clone(),
             );
         }
@@ -327,7 +396,7 @@ impl WindowsHelpApp {
 
     fn show_sidebar(&mut self, ctx: &egui::Context, active_alerts: usize) {
         let search_status = self.search_service.status();
-        let process_count = self.process_manager.snapshots().len();
+        let process_count = self.process_manager.state().summary.total_processes;
 
         egui::SidePanel::left("navigation")
             .resizable(false)
@@ -734,129 +803,66 @@ impl WindowsHelpApp {
         });
     }
     fn show_processes_view(&mut self, ui: &mut egui::Ui) {
-        theme::section_header(
-            ui,
-            "Processus",
-            "Liste vivante des processus et actions de controle rapides.",
-        );
+        render_processes_view(self, ui);
+    }
 
-        theme::panel_card(theme::ORANGE).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("FILTRE")
-                            .monospace()
-                            .color(theme::TEXT_SECONDARY),
-                    );
-                    ui.add_sized(
-                        [320.0, 34.0],
-                        egui::TextEdit::singleline(&mut self.process_filter),
-                    );
-                });
-                ui.vertical_centered(|ui| {
-                    ui.add_space(18.0);
-                    theme::status_chip(
-                        ui,
-                        format!("TOTAL {}", self.process_manager.snapshots().len()),
-                        theme::CYAN,
-                    );
-                });
-            });
-
-            if let Some(error) = self.process_manager.last_error() {
-                ui.add_space(8.0);
-                ui.label(RichText::new(error).color(theme::RED));
+    fn apply_process_action(&mut self, key: &ProcessKey, name: &str, action: ProcessAction) {
+        match self.process_manager.perform_action(key, action) {
+            Ok(result) => {
+                self.status_message = Some(process_action_message(name, key.pid, &result));
             }
-        });
+            Err(error) => {
+                self.status_message = Some(format!(
+                    "Action impossible sur {name} ({}) : {error}",
+                    key.pid
+                ));
+            }
+        }
+    }
 
-        let filter = self.process_filter.to_ascii_lowercase();
-        let mut processes = self.process_manager.snapshots();
-        if !filter.is_empty() {
-            processes.retain(|process| {
-                process.name.to_ascii_lowercase().contains(&filter)
-                    || process
-                        .path
-                        .as_ref()
-                        .map(|path| {
-                            path.display()
-                                .to_string()
-                                .to_ascii_lowercase()
-                                .contains(&filter)
-                        })
-                        .unwrap_or(false)
-                    || process.pid.to_string().contains(&filter)
-            });
+    fn sync_process_selection(&mut self, families: &[&ProcessFamily], rows: &[&ProcessRow]) {
+        if let Some(selected_key) = self.selected_process.as_ref()
+            && let Some(row) = rows.iter().copied().find(|row| &row.key == selected_key)
+        {
+            self.selected_family = Some(row.family_id.clone());
         }
 
-        ui.add_space(10.0);
-        theme::panel_card(theme::RED_SOFT).show(ui, |ui| {
-            theme::section_header(
-                ui,
-                "Table des processus",
-                "Tri visuel dense, priorites et actions",
-            );
+        let visible_family_ids = families
+            .iter()
+            .map(|family| family.id.as_str())
+            .collect::<HashSet<_>>();
+        if self
+            .selected_family
+            .as_deref()
+            .map(|family| !visible_family_ids.contains(family))
+            .unwrap_or(true)
+        {
+            self.selected_family = families.first().map(|family| family.id.clone());
+        }
 
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    egui::Grid::new("process-grid")
-                        .num_columns(8)
-                        .striped(true)
-                        .spacing([12.0, 10.0])
-                        .show(ui, |ui| {
-                            ui.strong("Nom");
-                            ui.strong("PID");
-                            ui.strong("CPU %");
-                            ui.strong("Memoire");
-                            ui.strong("Threads");
-                            ui.strong("Etat");
-                            ui.strong("Priorite");
-                            ui.strong("Actions");
-                            ui.end_row();
+        let relevant_rows = if self.process_tab == ProcessTab::Families {
+            if let Some(selected_family) = self.selected_family.as_deref() {
+                rows.iter()
+                    .copied()
+                    .filter(|row| row.family_id == selected_family)
+                    .collect::<Vec<_>>()
+            } else {
+                rows.to_vec()
+            }
+        } else {
+            rows.to_vec()
+        };
 
-                            for process in processes.iter().take(300) {
-                                ui.label(RichText::new(&process.name).color(theme::TEXT_PRIMARY));
-                                ui.label(
-                                    RichText::new(process.pid.to_string())
-                                        .monospace()
-                                        .color(theme::TEXT_SECONDARY),
-                                );
-                                ui.label(format!("{:.1}", process.cpu));
-                                ui.label(format_bytes(process.memory_bytes));
-                                ui.label(process.threads.to_string());
-                                ui.label(&process.status);
-                                ui.label(process.priority.label());
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("Terminer").clicked() {
-                                        self.confirm_kill = Some((process.pid, process.name.clone()));
-                                    }
-                                    ui.menu_button("Priorite", |ui| {
-                                        for priority in PriorityClass::all() {
-                                            if ui.button(priority.label()).clicked() {
-                                                if let Err(error) = self.process_manager.perform_action(
-                                                    process.pid,
-                                                    ProcessAction::SetPriority(priority),
-                                                ) {
-                                                    self.status_message = Some(format!(
-                                                        "Echec de la mise a jour de la priorite : {error}"
-                                                    ));
-                                                } else {
-                                                    self.status_message = Some(format!(
-                                                        "Priorite mise a jour pour {} ({})",
-                                                        process.name, process.pid
-                                                    ));
-                                                }
-                                                ui.close();
-                                            }
-                                        }
-                                    });
-                                });
-                                ui.end_row();
-                            }
-                        });
-                });
-        });
+        if self
+            .selected_process
+            .as_ref()
+            .map(|selected| !relevant_rows.iter().any(|row| &row.key == selected))
+            .unwrap_or(true)
+        {
+            self.selected_process = relevant_rows.first().map(|row| row.key.clone());
+        }
     }
+
     fn show_monitor_view(&mut self, ui: &mut egui::Ui) {
         theme::section_header(
             ui,
@@ -1442,7 +1448,8 @@ impl eframe::App for WindowsHelpApp {
                 });
             });
 
-        if let Some((pid, name)) = self.confirm_kill.clone() {
+        if let Some((key, name)) = self.confirm_kill.clone() {
+            let pid = key.pid;
             egui::Window::new("Confirmer l'arrêt")
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .collapsible(false)
@@ -1450,7 +1457,7 @@ impl eframe::App for WindowsHelpApp {
                 .frame(theme::panel_card(theme::RED))
                 .show(ctx, |ui| {
                     ui.label(
-                        RichText::new(format!("Terminer {name} ({pid}) ?"))
+                        RichText::new(format!("Terminer {name} ({}) ?", key.pid))
                             .color(theme::TEXT_PRIMARY),
                     );
                     ui.add_space(8.0);
@@ -1472,9 +1479,9 @@ impl eframe::App for WindowsHelpApp {
                         if ui.button("Terminer le processus").clicked() {
                             match self
                                 .process_manager
-                                .perform_action(pid, ProcessAction::Kill)
+                                .perform_action(&key, ProcessAction::Kill)
                             {
-                                Ok(()) => {
+                                Ok(_result) => {
                                     self.status_message =
                                         Some(format!("Processus {name} ({pid}) terminé."));
                                 }
@@ -1488,6 +1495,868 @@ impl eframe::App for WindowsHelpApp {
                     });
                 });
         }
+    }
+}
+
+fn render_processes_view(app: &mut WindowsHelpApp, ui: &mut egui::Ui) {
+    theme::section_header(
+        ui,
+        "Processus",
+        "Diagnostic guide des applis qui consomment maintenant et dans la duree.",
+    );
+
+    let process_state = app.process_manager.state();
+    let monitor_state = app.monitor_service.snapshot_state();
+    let alerted_pids = process_alerted_pids(&monitor_state.events);
+    let bottleneck = monitor_state
+        .latest
+        .as_ref()
+        .map(|snapshot| {
+            diagnostic_bottleneck_from_metrics(
+                snapshot.cpu_usage_percent,
+                percent(snapshot.used_memory_bytes, snapshot.total_memory_bytes),
+            )
+        })
+        .unwrap_or(process_state.summary.bottleneck);
+
+    if let Some(error) = process_state.last_error.as_deref() {
+        theme::panel_card(theme::RED).show(ui, |ui| {
+            ui.label(RichText::new(error).color(theme::TEXT_PRIMARY));
+        });
+        ui.add_space(10.0);
+    }
+
+    ui.horizontal_wrapped(|ui| {
+        metric_card(
+            ui,
+            "Processus",
+            process_state.summary.total_processes.to_string(),
+            &format!(
+                "{} familles detectees",
+                process_state.summary.total_families
+            ),
+            CardTone::Info,
+        );
+        metric_card(
+            ui,
+            "Top impact",
+            process_state
+                .summary
+                .top_impact_name
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+            &format!("Bottleneck courant : {}", bottleneck.label()),
+            diagnostic_bottleneck_tone(bottleneck),
+        );
+        metric_card(
+            ui,
+            "Top memoire",
+            process_state
+                .summary
+                .top_memory_name
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+            &format!(
+                "{:.1}% RAM systeme",
+                process_state.summary.current_memory_percent
+            ),
+            CardTone::Default,
+        );
+        metric_card(
+            ui,
+            "Fermeture prudente",
+            process_state.summary.closeable_candidates.to_string(),
+            "Candidats fermables proprement",
+            if process_state.summary.closeable_candidates > 0 {
+                CardTone::Accent
+            } else {
+                CardTone::Info
+            },
+        );
+    });
+
+    ui.add_space(10.0);
+    render_process_recommendations(ui, &process_state, bottleneck, &alerted_pids);
+
+    let mut visible_rows = process_state
+        .rows
+        .iter()
+        .filter(|row| {
+            process_row_matches_filters(
+                row,
+                &app.process_filter,
+                app.hide_windows_processes,
+                app.show_only_suspects,
+                app.show_only_closeable,
+                &alerted_pids,
+            )
+        })
+        .collect::<Vec<_>>();
+    sort_process_rows(&mut visible_rows, app.process_sort);
+
+    let visible_family_ids = visible_rows
+        .iter()
+        .map(|row| row.family_id.clone())
+        .collect::<HashSet<_>>();
+    let mut visible_families = process_state
+        .families
+        .iter()
+        .filter(|family| visible_family_ids.contains(&family.id))
+        .collect::<Vec<_>>();
+    sort_process_families(&mut visible_families, app.process_sort);
+
+    app.sync_process_selection(&visible_families, &visible_rows);
+
+    ui.add_space(10.0);
+    render_process_filters(app, ui);
+
+    ui.add_space(10.0);
+    render_process_explorer(app, ui, &visible_rows, &visible_families, &alerted_pids);
+}
+
+fn render_process_recommendations(
+    ui: &mut egui::Ui,
+    process_state: &ProcessState,
+    bottleneck: ProcessBottleneck,
+    alerted_pids: &HashSet<u32>,
+) {
+    theme::panel_card(theme::ORANGE).show(ui, |ui| {
+        theme::section_header(
+            ui,
+            "Pourquoi le PC rame ?",
+            "Lecture rapide du moment avant de descendre dans la liste.",
+        );
+        ui.horizontal_wrapped(|ui| {
+            theme::status_chip(
+                ui,
+                format!("CPU {:.1}%", process_state.summary.current_cpu_percent),
+                theme::ORANGE,
+            );
+            theme::status_chip(
+                ui,
+                format!("RAM {:.1}%", process_state.summary.current_memory_percent),
+                theme::CYAN,
+            );
+            theme::status_chip(
+                ui,
+                format!("FOCUS {}", bottleneck.label()),
+                bottleneck_color(bottleneck),
+            );
+        });
+        ui.add_space(8.0);
+
+        if process_state.recommendations.is_empty() {
+            ui.label(
+                RichText::new("Aucune recommandation process forte pour le moment.")
+                    .color(theme::TEXT_SECONDARY),
+            );
+        } else {
+            for recommendation in process_state.recommendations.iter().take(3) {
+                theme::banner_frame(recommendation_color(recommendation)).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        theme::status_chip(
+                            ui,
+                            format!("IMPACT {}", recommendation.impact_score),
+                            recommendation_color(recommendation),
+                        );
+                        theme::status_chip(
+                            ui,
+                            recommendation.safety.label(),
+                            safety_color(recommendation.safety),
+                        );
+                        theme::status_chip(
+                            ui,
+                            recommendation.suggested_action.label(),
+                            action_color(recommendation.suggested_action),
+                        );
+                        if recommendation
+                            .target
+                            .as_ref()
+                            .map(|key| alerted_pids.contains(&key.pid))
+                            .unwrap_or(false)
+                        {
+                            theme::status_chip(ui, "Alerte active", theme::RED);
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&recommendation.title).color(theme::TEXT_PRIMARY));
+                    ui.label(
+                        RichText::new(&recommendation.details)
+                            .size(12.0)
+                            .color(theme::TEXT_SECONDARY),
+                    );
+                });
+                ui.add_space(8.0);
+            }
+        }
+    });
+}
+
+fn render_process_filters(app: &mut WindowsHelpApp, ui: &mut egui::Ui) {
+    theme::panel_card(theme::ORANGE_SOFT).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("FILTRE")
+                        .monospace()
+                        .color(theme::TEXT_SECONDARY),
+                );
+                ui.add_sized(
+                    [320.0, 34.0],
+                    egui::TextEdit::singleline(&mut app.process_filter),
+                );
+            });
+
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("VUE")
+                        .monospace()
+                        .color(theme::TEXT_SECONDARY),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for tab in [ProcessTab::Families, ProcessTab::Instances] {
+                        if ui
+                            .selectable_label(app.process_tab == tab, tab.label())
+                            .clicked()
+                        {
+                            app.process_tab = tab;
+                        }
+                    }
+                });
+            });
+
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("TRI")
+                        .monospace()
+                        .color(theme::TEXT_SECONDARY),
+                );
+                egui::ComboBox::from_id_salt("process-sort")
+                    .selected_text(app.process_sort.label())
+                    .show_ui(ui, |ui| {
+                        for sort in ProcessSort::all() {
+                            ui.selectable_value(&mut app.process_sort, sort, sort.label());
+                        }
+                    });
+            });
+
+            ui.add_space(12.0);
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("FILTRES")
+                        .monospace()
+                        .color(theme::TEXT_SECONDARY),
+                );
+                ui.checkbox(&mut app.hide_windows_processes, "Masquer Windows critique");
+                ui.checkbox(&mut app.show_only_suspects, "Suspects seulement");
+                ui.checkbox(&mut app.show_only_closeable, "Fermeture prudente seulement");
+            });
+        });
+    });
+}
+
+fn render_process_explorer(
+    app: &mut WindowsHelpApp,
+    ui: &mut egui::Ui,
+    visible_rows: &[&ProcessRow],
+    visible_families: &[&ProcessFamily],
+    _alerted_pids: &HashSet<u32>,
+) {
+    ui.columns(2, |columns| {
+        theme::panel_card(theme::RED_SOFT).show(&mut columns[0], |ui| {
+            theme::section_header(
+                ui,
+                app.process_tab.label(),
+                "Liste principale pour explorer par famille ou par instance.",
+            );
+
+            if app.process_tab == ProcessTab::Families {
+                render_process_family_list(app, ui, visible_rows, visible_families);
+            } else {
+                render_process_instance_list(app, ui, visible_rows);
+            }
+        });
+
+        theme::panel_card(theme::CYAN).show(&mut columns[1], |ui| {
+            theme::section_header(
+                ui,
+                "Detail du processus",
+                "Contexte, raisons et actions prudentes sur la selection courante.",
+            );
+            render_process_detail_panel(app, ui, visible_rows);
+        });
+    });
+}
+
+fn render_process_family_list(
+    app: &mut WindowsHelpApp,
+    ui: &mut egui::Ui,
+    visible_rows: &[&ProcessRow],
+    visible_families: &[&ProcessFamily],
+) {
+    if visible_families.is_empty() {
+        ui.label(
+            RichText::new("Aucune famille ne correspond aux filtres.").color(theme::TEXT_SECONDARY),
+        );
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, 94.0, visible_families.len(), |ui, row_range| {
+            for index in row_range {
+                let family = visible_families[index];
+                let selected = app.selected_family.as_deref() == Some(family.id.as_str());
+                let response = theme::banner_frame(if selected {
+                    theme::ORANGE
+                } else {
+                    recommendation_family_color(family)
+                })
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        theme::status_chip(
+                            ui,
+                            format!("IMPACT {}", family.max_impact_score),
+                            recommendation_family_color(family),
+                        );
+                        theme::status_chip(
+                            ui,
+                            format!("{} proc", family.instance_count),
+                            theme::CYAN,
+                        );
+                        theme::status_chip(ui, family.safety.label(), safety_color(family.safety));
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&family.label).color(theme::TEXT_PRIMARY));
+                    ui.label(
+                        RichText::new(format!(
+                            "CPU moyen {:.1}% // memoire {} // {}",
+                            family.cpu_avg_10s_total,
+                            format_bytes(family.memory_bytes_total),
+                            family.primary_reason
+                        ))
+                        .size(12.0)
+                        .color(theme::TEXT_SECONDARY),
+                    );
+                })
+                .response;
+
+                if response.clicked() {
+                    app.selected_family = Some(family.id.clone());
+                    app.selected_process = visible_rows
+                        .iter()
+                        .copied()
+                        .find(|row| row.family_id == family.id)
+                        .map(|row| row.key.clone());
+                }
+                ui.add_space(8.0);
+            }
+        });
+}
+
+fn render_process_instance_list(
+    app: &mut WindowsHelpApp,
+    ui: &mut egui::Ui,
+    visible_rows: &[&ProcessRow],
+) {
+    if visible_rows.is_empty() {
+        ui.label(
+            RichText::new("Aucune instance ne correspond aux filtres.")
+                .color(theme::TEXT_SECONDARY),
+        );
+        return;
+    }
+
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, 88.0, visible_rows.len(), |ui, row_range| {
+            for index in row_range {
+                let row = visible_rows[index];
+                let selected = app
+                    .selected_process
+                    .as_ref()
+                    .map(|key| key == &row.key)
+                    .unwrap_or(false);
+                let response = theme::banner_frame(if selected {
+                    theme::CYAN
+                } else {
+                    recommendation_row_color(row)
+                })
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        theme::status_chip(ui, format!("PID {}", row.key.pid), theme::CYAN);
+                        theme::status_chip(
+                            ui,
+                            format!("IMPACT {}", row.insight.impact_score),
+                            recommendation_row_color(row),
+                        );
+                        theme::status_chip(
+                            ui,
+                            row.insight.safety.label(),
+                            safety_color(row.insight.safety),
+                        );
+                    });
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(&row.name).color(theme::TEXT_PRIMARY));
+                    ui.label(
+                        RichText::new(format!(
+                            "CPU now {:.1}% // CPU moyen {:.1}% // memoire {}",
+                            row.cpu_now,
+                            row.insight.cpu_avg_10s,
+                            format_bytes(row.memory_bytes)
+                        ))
+                        .size(12.0)
+                        .color(theme::TEXT_SECONDARY),
+                    );
+                })
+                .response;
+
+                if response.clicked() {
+                    app.selected_family = Some(row.family_id.clone());
+                    app.selected_process = Some(row.key.clone());
+                }
+                ui.add_space(8.0);
+            }
+        });
+}
+
+fn render_process_detail_panel(
+    app: &mut WindowsHelpApp,
+    ui: &mut egui::Ui,
+    visible_rows: &[&ProcessRow],
+) {
+    let selected_row = visible_rows
+        .iter()
+        .copied()
+        .find(|row| {
+            app.selected_process
+                .as_ref()
+                .map(|selected| selected == &row.key)
+                .unwrap_or(false)
+        })
+        .or_else(|| visible_rows.first().copied());
+
+    let Some(row) = selected_row else {
+        ui.label(
+            RichText::new("Selectionnez une famille ou une instance pour voir le detail.")
+                .color(theme::TEXT_SECONDARY),
+        );
+        return;
+    };
+
+    let family_members = visible_rows
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.family_id == row.family_id)
+        .collect::<Vec<_>>();
+
+    ui.horizontal_wrapped(|ui| {
+        theme::status_chip(ui, format!("PID {}", row.key.pid), theme::CYAN);
+        theme::status_chip(
+            ui,
+            row.insight.safety.label(),
+            safety_color(row.insight.safety),
+        );
+        theme::status_chip(
+            ui,
+            row.insight.suggested_action.label(),
+            action_color(row.insight.suggested_action),
+        );
+        theme::status_chip(ui, row.insight.trend.label(), recommendation_row_color(row));
+    });
+    ui.add_space(8.0);
+    ui.label(
+        RichText::new(&row.name)
+            .size(22.0)
+            .color(theme::TEXT_PRIMARY),
+    );
+    ui.label(
+        RichText::new(format!(
+            "Etat {} // priorite {} // runtime {}",
+            row.status,
+            row.priority.label(),
+            format_duration(row.run_time_secs)
+        ))
+        .size(12.0)
+        .color(theme::TEXT_SECONDARY),
+    );
+    ui.add_space(10.0);
+
+    ui.horizontal_wrapped(|ui| {
+        metric_card(
+            ui,
+            "Impact",
+            row.insight.impact_score.to_string(),
+            "Score de pression globale",
+            process_tone(row.insight.impact_score),
+        );
+        metric_card(
+            ui,
+            "CPU",
+            format!("{:.1}% / {:.1}%", row.cpu_now, row.insight.cpu_avg_10s),
+            "Instantane / moyenne 10 s",
+            process_tone(row.insight.impact_score),
+        );
+        metric_card(
+            ui,
+            "Memoire",
+            format_bytes(row.memory_bytes),
+            &format!("{:.1}% de la RAM systeme", row.insight.memory_percent),
+            CardTone::Info,
+        );
+        metric_card(
+            ui,
+            "Disque",
+            format!("{}/s", format_bytes(row.insight.disk_io_bytes_per_sec)),
+            "Debit observe sur la fenetre courte",
+            CardTone::Default,
+        );
+    });
+
+    ui.add_space(10.0);
+    theme::banner_frame(theme::BORDER).show(ui, |ui| {
+        ui.label(
+            RichText::new("Pourquoi il remonte ici")
+                .monospace()
+                .color(theme::TEXT_SECONDARY),
+        );
+        ui.add_space(6.0);
+        for reason in &row.insight.reasons {
+            ui.label(RichText::new(format!("- {reason}")).color(theme::TEXT_PRIMARY));
+        }
+    });
+
+    ui.add_space(10.0);
+    theme::banner_frame(theme::CYAN).show(ui, |ui| {
+        ui.label(
+            RichText::new("Contexte")
+                .monospace()
+                .color(theme::TEXT_SECONDARY),
+        );
+        ui.add_space(6.0);
+        ui.label(RichText::new(format!("Famille : {}", row.family_id)).color(theme::TEXT_PRIMARY));
+        ui.label(
+            RichText::new(format!("Parent PID : {}", row.parent_pid.unwrap_or(0)))
+                .color(theme::TEXT_PRIMARY),
+        );
+        ui.label(RichText::new(format!("Threads : {}", row.threads)).color(theme::TEXT_PRIMARY));
+        ui.label(
+            RichText::new(format!(
+                "Demarre le : {}",
+                format_timestamp(row.key.started_at.map(|value| value as i64))
+            ))
+            .color(theme::TEXT_PRIMARY),
+        );
+        ui.label(
+            RichText::new(
+                row.path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "Chemin indisponible".into()),
+            )
+            .size(12.0)
+            .color(theme::TEXT_SECONDARY),
+        );
+    });
+
+    ui.add_space(10.0);
+    ui.horizontal_wrapped(|ui| {
+        if (row.has_visible_window
+            || row.insight.suggested_action == SuggestedAction::CloseGracefully)
+            && ui.button("Fermer proprement").clicked()
+        {
+            app.apply_process_action(&row.key, &row.name, ProcessAction::CloseGracefully);
+        }
+
+        if ui.button("Priorite basse").clicked() {
+            app.apply_process_action(
+                &row.key,
+                &row.name,
+                ProcessAction::SetPriority(PriorityClass::BelowNormal),
+            );
+        }
+
+        if row.priority != PriorityClass::Normal && ui.button("Priorite normale").clicked() {
+            app.apply_process_action(
+                &row.key,
+                &row.name,
+                ProcessAction::SetPriority(PriorityClass::Normal),
+            );
+        }
+
+        if let Some(path) = row.path.as_ref()
+            && ui.button("Ouvrir le dossier").clicked()
+        {
+            if let Err(error) = reveal_in_explorer(path) {
+                app.status_message =
+                    Some(format!("Affichage dans l'Explorateur impossible : {error}"));
+            }
+        }
+
+        ui.menu_button("Danger", |ui| {
+            if ui.button("Terminer de force").clicked() {
+                app.confirm_kill = Some((row.key.clone(), row.name.clone()));
+                ui.close();
+            }
+        });
+    });
+
+    if !family_members.is_empty() {
+        ui.add_space(12.0);
+        theme::section_header(
+            ui,
+            "Autres instances de la famille",
+            "Pratique pour naviguer dans les sous-processus du meme groupe.",
+        );
+        for member in family_members.iter().take(8) {
+            let selected = app
+                .selected_process
+                .as_ref()
+                .map(|key| key == &member.key)
+                .unwrap_or(false);
+            if ui
+                .selectable_label(
+                    selected,
+                    format!(
+                        "{} // PID {} // impact {} // memoire {}",
+                        member.name,
+                        member.key.pid,
+                        member.insight.impact_score,
+                        format_bytes(member.memory_bytes)
+                    ),
+                )
+                .clicked()
+            {
+                app.selected_process = Some(member.key.clone());
+                app.selected_family = Some(member.family_id.clone());
+            }
+        }
+    }
+}
+
+fn process_row_matches_filters(
+    row: &ProcessRow,
+    filter: &str,
+    hide_windows_processes: bool,
+    show_only_suspects: bool,
+    show_only_closeable: bool,
+    alerted_pids: &HashSet<u32>,
+) -> bool {
+    if hide_windows_processes
+        && matches!(
+            row.insight.safety,
+            ProcessSafety::CriticalSystem | ProcessSafety::WindowsComponent
+        )
+    {
+        return false;
+    }
+
+    if show_only_suspects && !is_suspect_row(row, alerted_pids) {
+        return false;
+    }
+
+    if show_only_closeable && row.insight.suggested_action != SuggestedAction::CloseGracefully {
+        return false;
+    }
+
+    let trimmed_filter = filter.trim().to_ascii_lowercase();
+    if trimmed_filter.is_empty() {
+        return true;
+    }
+
+    row.name.to_ascii_lowercase().contains(&trimmed_filter)
+        || row.family_id.to_ascii_lowercase().contains(&trimmed_filter)
+        || row.key.pid.to_string().contains(&trimmed_filter)
+        || row
+            .path
+            .as_ref()
+            .map(|path| {
+                path.display()
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains(&trimmed_filter)
+            })
+            .unwrap_or(false)
+}
+
+fn is_suspect_row(row: &ProcessRow, alerted_pids: &HashSet<u32>) -> bool {
+    row.insight.impact_score >= 40
+        || row.insight.cpu_avg_10s >= 10.0
+        || row.insight.memory_percent >= 5.0
+        || alerted_pids.contains(&row.key.pid)
+}
+
+fn sort_process_rows(rows: &mut Vec<&ProcessRow>, sort: ProcessSort) {
+    rows.sort_by(|left, right| match sort {
+        ProcessSort::Impact => right
+            .insight
+            .impact_score
+            .cmp(&left.insight.impact_score)
+            .then_with(|| {
+                right
+                    .insight
+                    .cpu_avg_10s
+                    .partial_cmp(&left.insight.cpu_avg_10s)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        ProcessSort::CpuNow => right
+            .cpu_now
+            .partial_cmp(&left.cpu_now)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        ProcessSort::CpuAverage => right
+            .insight
+            .cpu_avg_10s
+            .partial_cmp(&left.insight.cpu_avg_10s)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        ProcessSort::Memory => right.memory_bytes.cmp(&left.memory_bytes),
+        ProcessSort::Name => left.name.cmp(&right.name),
+    });
+}
+
+fn sort_process_families(families: &mut Vec<&ProcessFamily>, sort: ProcessSort) {
+    families.sort_by(|left, right| match sort {
+        ProcessSort::Impact => right
+            .max_impact_score
+            .cmp(&left.max_impact_score)
+            .then_with(|| {
+                right
+                    .cpu_avg_10s_total
+                    .partial_cmp(&left.cpu_avg_10s_total)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }),
+        ProcessSort::CpuNow => right
+            .cpu_now_total
+            .partial_cmp(&left.cpu_now_total)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        ProcessSort::CpuAverage => right
+            .cpu_avg_10s_total
+            .partial_cmp(&left.cpu_avg_10s_total)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        ProcessSort::Memory => right.memory_bytes_total.cmp(&left.memory_bytes_total),
+        ProcessSort::Name => left.label.cmp(&right.label),
+    });
+}
+
+fn process_alerted_pids(events: &[AlertEvent]) -> HashSet<u32> {
+    events
+        .iter()
+        .filter(|event| matches!(event.state, AlertEventState::Active))
+        .filter_map(|event| event.source_pid)
+        .collect()
+}
+
+fn process_action_message(name: &str, pid: u32, result: &ProcessActionResult) -> String {
+    match result {
+        ProcessActionResult::CloseRequested => {
+            format!("Fermeture demandee a {name} ({pid}). Verification en cours.")
+        }
+        ProcessActionResult::ClosedGracefully => {
+            format!("Processus {name} ({pid}) ferme proprement.")
+        }
+        ProcessActionResult::ForceTerminated => {
+            format!("Processus {name} ({pid}) termine de force.")
+        }
+        ProcessActionResult::PriorityUpdated(priority) => {
+            format!("Priorite {} appliquee a {name} ({pid}).", priority.label())
+        }
+    }
+}
+
+fn diagnostic_bottleneck_from_metrics(cpu_percent: f32, memory_percent: f32) -> ProcessBottleneck {
+    if cpu_percent < 65.0 && memory_percent < 70.0 {
+        ProcessBottleneck::Quiet
+    } else if cpu_percent >= 80.0 && memory_percent >= 80.0 {
+        ProcessBottleneck::Mixed
+    } else if cpu_percent >= memory_percent + 8.0 {
+        ProcessBottleneck::Cpu
+    } else if memory_percent >= cpu_percent + 5.0 {
+        ProcessBottleneck::Memory
+    } else {
+        ProcessBottleneck::Mixed
+    }
+}
+
+fn process_tone(impact_score: u8) -> CardTone {
+    if impact_score >= 75 {
+        CardTone::Danger
+    } else if impact_score >= 50 {
+        CardTone::Warning
+    } else if impact_score >= 25 {
+        CardTone::Accent
+    } else {
+        CardTone::Info
+    }
+}
+
+fn diagnostic_bottleneck_tone(bottleneck: ProcessBottleneck) -> CardTone {
+    match bottleneck {
+        ProcessBottleneck::Quiet => CardTone::Info,
+        ProcessBottleneck::Cpu | ProcessBottleneck::Memory => CardTone::Warning,
+        ProcessBottleneck::Mixed => CardTone::Danger,
+    }
+}
+
+fn recommendation_row_color(row: &ProcessRow) -> Color32 {
+    impact_color(row.insight.impact_score)
+}
+
+fn recommendation_family_color(family: &ProcessFamily) -> Color32 {
+    impact_color(family.max_impact_score)
+}
+
+fn recommendation_color(recommendation: &ProcessRecommendation) -> Color32 {
+    impact_color(recommendation.impact_score)
+}
+
+fn impact_color(impact_score: u8) -> Color32 {
+    if impact_score >= 75 {
+        theme::RED
+    } else if impact_score >= 50 {
+        theme::WARNING
+    } else if impact_score >= 25 {
+        theme::ORANGE
+    } else {
+        theme::CYAN
+    }
+}
+
+fn safety_color(safety: ProcessSafety) -> Color32 {
+    match safety {
+        ProcessSafety::CriticalSystem => theme::RED,
+        ProcessSafety::WindowsComponent => theme::ORANGE,
+        ProcessSafety::Caution => theme::WARNING,
+        ProcessSafety::LikelyClosable => theme::CYAN,
+        ProcessSafety::Unknown => theme::TEXT_SECONDARY,
+    }
+}
+
+fn action_color(action: SuggestedAction) -> Color32 {
+    match action {
+        SuggestedAction::None => theme::TEXT_SECONDARY,
+        SuggestedAction::CloseGracefully => theme::CYAN,
+        SuggestedAction::LowerPriority => theme::ORANGE,
+        SuggestedAction::ReviewOnly => theme::WARNING,
+    }
+}
+
+fn bottleneck_color(bottleneck: ProcessBottleneck) -> Color32 {
+    match bottleneck {
+        ProcessBottleneck::Quiet => theme::CYAN,
+        ProcessBottleneck::Cpu => theme::ORANGE,
+        ProcessBottleneck::Memory => theme::WARNING,
+        ProcessBottleneck::Mixed => theme::RED,
+    }
+}
+
+fn format_duration(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{} h", seconds / 3600)
+    } else if seconds >= 60 {
+        format!("{} min", seconds / 60)
+    } else {
+        format!("{seconds} s")
     }
 }
 
@@ -1894,6 +2763,7 @@ mod tests {
                 kind: AlertEventKind::MetricThreshold,
                 rule_id: "cpu".into(),
                 source_label: "CPU".into(),
+                source_pid: Some(1),
                 message: "first".into(),
                 state: AlertEventState::Active,
                 value_percent: 95.0,
@@ -1905,6 +2775,7 @@ mod tests {
                 kind: AlertEventKind::MetricThreshold,
                 rule_id: "cpu".into(),
                 source_label: "CPU".into(),
+                source_pid: Some(1),
                 message: "latest".into(),
                 state: AlertEventState::Active,
                 value_percent: 97.0,
@@ -1916,6 +2787,7 @@ mod tests {
                 kind: AlertEventKind::CoolingActionApplied,
                 rule_id: "cooling".into(),
                 source_label: "Fan".into(),
+                source_pid: None,
                 message: "transient".into(),
                 state: AlertEventState::Active,
                 value_percent: 0.0,
@@ -1927,6 +2799,7 @@ mod tests {
                 kind: AlertEventKind::MetricThreshold,
                 rule_id: "memory".into(),
                 source_label: "RAM".into(),
+                source_pid: None,
                 message: "resolved".into(),
                 state: AlertEventState::Resolved,
                 value_percent: 91.0,
@@ -1942,5 +2815,38 @@ mod tests {
         assert_eq!(active_alerts.len(), 1);
         assert_eq!(active_alerts[0].message, "latest");
         assert_eq!(active_alerts[0].source_label, "CPU");
+    }
+
+    #[test]
+    fn active_alerts_keep_distinct_process_pids_separate() {
+        let events = vec![
+            AlertEvent {
+                kind: AlertEventKind::MetricThreshold,
+                rule_id: "process-cpu".into(),
+                source_label: "chrome.exe".into(),
+                source_pid: Some(10),
+                message: "pid10".into(),
+                state: AlertEventState::Active,
+                value_percent: 90.0,
+                threshold_percent: 80.0,
+                triggered_at_utc: 1,
+                resolved_at_utc: None,
+            },
+            AlertEvent {
+                kind: AlertEventKind::MetricThreshold,
+                rule_id: "process-cpu".into(),
+                source_label: "chrome.exe".into(),
+                source_pid: Some(11),
+                message: "pid11".into(),
+                state: AlertEventState::Active,
+                value_percent: 85.0,
+                threshold_percent: 80.0,
+                triggered_at_utc: 2,
+                resolved_at_utc: None,
+            },
+        ];
+
+        let active_alerts = WindowsHelpApp::active_alerts(&events);
+        assert_eq!(active_alerts.len(), 2);
     }
 }

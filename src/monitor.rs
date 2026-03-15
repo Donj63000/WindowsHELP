@@ -10,9 +10,9 @@ use tokio::runtime::Handle;
 
 use crate::platform_windows::show_toast_notification;
 use crate::thermal::{
-    CapturedControlState, CoolingAction, CoolingActionRecord, TemperatureReading,
-    ThermalAutomationController, ThermalCapabilities, ThermalManager, ThermalSettings,
-    ThermalState, ThermalStatusSnapshot, next_thermal_state, thresholds_for_reading,
+    CapturedControlState, CoolingActionRecord, TemperatureReading, ThermalAutomationController,
+    ThermalCapabilities, ThermalManager, ThermalSettings, ThermalState, ThermalStatusSnapshot,
+    next_thermal_state, thresholds_for_reading,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +138,7 @@ pub struct AlertEvent {
     pub kind: AlertEventKind,
     pub rule_id: String,
     pub source_label: String,
+    pub source_pid: Option<u32>,
     pub message: String,
     pub state: AlertEventState,
     pub value_percent: f32,
@@ -236,6 +237,7 @@ struct AlertTracker {
 struct AlertEvaluation {
     key: String,
     source_label: String,
+    source_pid: Option<u32>,
     value_percent: f32,
     threshold_percent: f32,
     exceeded: bool,
@@ -605,6 +607,7 @@ fn evaluate_thermal_cycle<C: ThermalAutomationController>(
                 kind: AlertEventKind::TemperatureWarning,
                 rule_id: "temperature-warning".into(),
                 source_label,
+                source_pid: None,
                 message: "temperature revenue a la normale".into(),
                 state: AlertEventState::Resolved,
                 value_percent: 0.0,
@@ -616,6 +619,7 @@ fn evaluate_thermal_cycle<C: ThermalAutomationController>(
                 kind: AlertEventKind::TemperatureCritical,
                 rule_id: "temperature-critical".into(),
                 source_label,
+                source_pid: None,
                 message: "temperature critique terminee".into(),
                 state: AlertEventState::Resolved,
                 value_percent: 0.0,
@@ -670,6 +674,7 @@ fn evaluate_thermal_cycle<C: ThermalAutomationController>(
                         kind: AlertEventKind::CoolingActionApplied,
                         rule_id: "cooling-action-applied".into(),
                         source_label: "Refroidissement automatique".into(),
+                        source_pid: None,
                         message: format!("{} active", action.label()),
                         state: AlertEventState::Resolved,
                         value_percent: 0.0,
@@ -686,6 +691,7 @@ fn evaluate_thermal_cycle<C: ThermalAutomationController>(
                         kind: AlertEventKind::CoolingActionFailed,
                         rule_id: "cooling-action-failed".into(),
                         source_label: "Refroidissement automatique".into(),
+                        source_pid: None,
                         message: runtime
                             .last_error
                             .clone()
@@ -704,6 +710,7 @@ fn evaluate_thermal_cycle<C: ThermalAutomationController>(
                 kind: AlertEventKind::CoolingActionFailed,
                 rule_id: "cooling-action-failed".into(),
                 source_label: "Refroidissement automatique".into(),
+                source_pid: None,
                 message: runtime
                     .last_error
                     .clone()
@@ -753,6 +760,7 @@ fn maybe_restore_previous_cooling<C: ThermalAutomationController>(
             kind: AlertEventKind::CoolingActionFailed,
             rule_id: "cooling-action-failed".into(),
             source_label: "Refroidissement automatique".into(),
+            source_pid: None,
             message: runtime
                 .last_error
                 .clone()
@@ -785,6 +793,7 @@ fn maybe_restore_previous_cooling<C: ThermalAutomationController>(
                 kind: AlertEventKind::CoolingActionRestored,
                 rule_id: "cooling-action-restored".into(),
                 source_label: "Refroidissement automatique".into(),
+                source_pid: None,
                 message: format!("etat precedent restaure apres {reason}"),
                 state: AlertEventState::Resolved,
                 value_percent: 0.0,
@@ -801,6 +810,7 @@ fn maybe_restore_previous_cooling<C: ThermalAutomationController>(
                 kind: AlertEventKind::CoolingActionFailed,
                 rule_id: "cooling-action-failed".into(),
                 source_label: "Refroidissement automatique".into(),
+                source_pid: None,
                 message: runtime
                     .last_error
                     .clone()
@@ -830,6 +840,7 @@ fn push_temperature_transition_events(
             kind: AlertEventKind::TemperatureWarning,
             rule_id: "temperature-warning".into(),
             source_label: reading.name.clone(),
+            source_pid: None,
             message: format!(
                 "temperature elevee: {:.1} C (seuil {:.1} C)",
                 current_temperature, warning_celsius
@@ -844,6 +855,7 @@ fn push_temperature_transition_events(
             kind: AlertEventKind::TemperatureWarning,
             rule_id: "temperature-warning".into(),
             source_label: reading.name.clone(),
+            source_pid: None,
             message: format!("temperature revenue a {:.1} C", current_temperature),
             state: AlertEventState::Resolved,
             value_percent: current_temperature,
@@ -855,6 +867,7 @@ fn push_temperature_transition_events(
             kind: AlertEventKind::TemperatureCritical,
             rule_id: "temperature-critical".into(),
             source_label: reading.name.clone(),
+            source_pid: None,
             message: format!(
                 "temperature critique: {:.1} C (seuil {:.1} C)",
                 current_temperature, critical_celsius
@@ -870,6 +883,7 @@ fn push_temperature_transition_events(
                 kind: AlertEventKind::TemperatureWarning,
                 rule_id: "temperature-warning".into(),
                 source_label: reading.name.clone(),
+                source_pid: None,
                 message: format!(
                     "temperature warning remplacee par un etat critique ({:.1} C)",
                     current_temperature
@@ -884,6 +898,7 @@ fn push_temperature_transition_events(
                 kind: AlertEventKind::TemperatureCritical,
                 rule_id: "temperature-critical".into(),
                 source_label: reading.name.clone(),
+                source_pid: None,
                 message: format!(
                     "temperature critique: {:.1} C (seuil {:.1} C)",
                     current_temperature, critical_celsius
@@ -900,6 +915,7 @@ fn push_temperature_transition_events(
                 kind: AlertEventKind::TemperatureCritical,
                 rule_id: "temperature-critical".into(),
                 source_label: reading.name.clone(),
+                source_pid: None,
                 message: format!(
                     "temperature critique quittee a {:.1} C",
                     current_temperature
@@ -914,6 +930,7 @@ fn push_temperature_transition_events(
                 kind: AlertEventKind::TemperatureWarning,
                 rule_id: "temperature-warning".into(),
                 source_label: reading.name.clone(),
+                source_pid: None,
                 message: format!(
                     "temperature encore elevee: {:.1} C (seuil {:.1} C)",
                     current_temperature, warning_celsius
@@ -929,6 +946,7 @@ fn push_temperature_transition_events(
             kind: AlertEventKind::TemperatureCritical,
             rule_id: "temperature-critical".into(),
             source_label: reading.name.clone(),
+            source_pid: None,
             message: format!(
                 "temperature critique terminee a {:.1} C",
                 current_temperature
@@ -974,6 +992,7 @@ fn evaluate_alerts(
                         kind: AlertEventKind::MetricThreshold,
                         rule_id: rule.id.clone(),
                         source_label: evaluation.source_label.clone(),
+                        source_pid: evaluation.source_pid,
                         message: format!(
                             "{} a depasse {:.1}% (actuel : {:.1}%)",
                             evaluation.source_label,
@@ -994,6 +1013,7 @@ fn evaluate_alerts(
                     kind: AlertEventKind::MetricThreshold,
                     rule_id: rule.id.clone(),
                     source_label: evaluation.source_label.clone(),
+                    source_pid: evaluation.source_pid,
                     message: format!(
                         "{} est revenu sous {:.1}% (actuel : {:.1}%)",
                         evaluation.source_label,
@@ -1047,6 +1067,7 @@ fn evaluate_alerts(
                     kind: AlertEventKind::MetricThreshold,
                     rule_id: rule_id.to_owned(),
                     source_label: source_label.to_owned(),
+                    source_pid: None,
                     message: format!("{source_label} est revenu a la normale"),
                     state: AlertEventState::Resolved,
                     value_percent: 0.0,
@@ -1070,6 +1091,7 @@ fn build_evaluations(
         AlertRuleKind::SystemCpu => vec![AlertEvaluation {
             key: format!("{}:system-cpu", rule.id),
             source_label: "CPU systeme".into(),
+            source_pid: None,
             value_percent: snapshot.cpu_usage_percent,
             threshold_percent: rule.threshold_percent,
             exceeded: snapshot.cpu_usage_percent >= rule.threshold_percent,
@@ -1077,6 +1099,7 @@ fn build_evaluations(
         AlertRuleKind::SystemMemory => vec![AlertEvaluation {
             key: format!("{}:system-memory", rule.id),
             source_label: "Memoire systeme".into(),
+            source_pid: None,
             value_percent: percent(snapshot.used_memory_bytes, snapshot.total_memory_bytes),
             threshold_percent: rule.threshold_percent,
             exceeded: percent(snapshot.used_memory_bytes, snapshot.total_memory_bytes)
@@ -1088,6 +1111,7 @@ fn build_evaluations(
             .map(|disk| AlertEvaluation {
                 key: format!("{}:{}", rule.id, disk.mount_point.display()),
                 source_label: format!("Disque {}", disk.mount_point.display()),
+                source_pid: None,
                 value_percent: disk.used_percent,
                 threshold_percent: rule.threshold_percent,
                 exceeded: disk.used_percent >= rule.threshold_percent,
@@ -1098,6 +1122,7 @@ fn build_evaluations(
             .map(|process| AlertEvaluation {
                 key: format!("{}:{} ({})", rule.id, process.pid, process.name),
                 source_label: format!("{} ({})", process.name, process.pid),
+                source_pid: Some(process.pid),
                 value_percent: process.cpu,
                 threshold_percent: rule.threshold_percent,
                 exceeded: process.cpu >= rule.threshold_percent,
@@ -1108,6 +1133,7 @@ fn build_evaluations(
             .map(|process| AlertEvaluation {
                 key: format!("{}:{} ({})", rule.id, process.pid, process.name),
                 source_label: format!("{} ({})", process.name, process.pid),
+                source_pid: Some(process.pid),
                 value_percent: process.memory_percent,
                 threshold_percent: rule.threshold_percent,
                 exceeded: process.memory_percent >= rule.threshold_percent,
@@ -1128,7 +1154,8 @@ fn percent(value: u64, total: u64) -> f32 {
 mod tests {
     use super::*;
     use crate::thermal::{
-        TemperatureSensorKind, TemperatureSource, ThermalThresholdMode, ThermalThresholdPair,
+        CoolingAction, TemperatureSensorKind, TemperatureSource, ThermalThresholdMode,
+        ThermalThresholdPair,
     };
     use anyhow::anyhow;
 
@@ -1276,6 +1303,30 @@ mod tests {
         let resolved = evaluate_alerts(&[rule], &snapshot_with_cpu(11, 20.0), &[], &mut trackers);
         assert_eq!(resolved.len(), 1);
         assert!(matches!(resolved[0].state, AlertEventState::Resolved));
+    }
+
+    #[test]
+    fn process_alert_evaluations_keep_source_pid() {
+        let rule = AlertRule {
+            id: "process-cpu".into(),
+            label: "CPU process".into(),
+            enabled: true,
+            kind: AlertRuleKind::ProcessCpu,
+            threshold_percent: 50.0,
+            sustain_seconds: 1,
+        };
+        let snapshot = snapshot_with_cpu(0, 10.0);
+        let processes = vec![ProcessMetric {
+            pid: 42,
+            name: "discord.exe".into(),
+            cpu: 75.0,
+            memory_bytes: 10,
+            memory_percent: 1.0,
+        }];
+
+        let evaluations = build_evaluations(&rule, &snapshot, &processes);
+        assert_eq!(evaluations.len(), 1);
+        assert_eq!(evaluations[0].source_pid, Some(42));
     }
 
     #[test]
