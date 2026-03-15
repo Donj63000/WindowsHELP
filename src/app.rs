@@ -36,6 +36,23 @@ impl View {
             Self::Settings => "Paramètres",
         }
     }
+
+    /// Sous-titre affiche dans la top bar.
+    fn description(self) -> &'static str {
+        match self {
+            Self::Search => "Recherche instantanée dans l'index local sans bloquer l'interface.",
+            Self::Processes => "Inspection, tri et contrôle des processus Windows en direct.",
+            Self::Monitor => {
+                "Vue temps réel du CPU, de la mémoire, du réseau, des disques et des alertes."
+            }
+            Self::Temperatures => {
+                "Suivi thermique, capteurs disponibles et automatisation du refroidissement."
+            }
+            Self::Settings => {
+                "Configuration persistante de l'indexation, de la surveillance et des seuils."
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -314,27 +331,17 @@ impl WindowsHelpApp {
 
         egui::SidePanel::left("navigation")
             .resizable(false)
-            .default_width(265.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG_PANEL_ALT)
-                    .inner_margin(egui::Margin::same(14))
-                    .stroke(Stroke::new(2.0, theme::ORANGE_SOFT))
-                    .shadow(egui::Shadow {
-                        offset: [2, 0],
-                        blur: 10,
-                        spread: 0,
-                        color: Color32::from_rgba_unmultiplied(0, 0, 0, 55),
-                    }),
-            )
+            .default_width(278.0)
+            .frame(theme::sidebar_frame())
             .show(ctx, |ui| {
                 theme::panel_card(theme::ORANGE).show(ui, |ui| {
                     ui.label(
-                        RichText::new("ACCESS // WINDOWSHELP")
+                        RichText::new("WINDOWSHELP // CYBER OPS")
                             .text_style(egui::TextStyle::Small)
                             .monospace()
                             .color(theme::ORANGE),
                     );
+                    ui.add_space(4.0);
                     ui.label(
                         RichText::new("WindowsHELP")
                             .text_style(egui::TextStyle::Name("Hero".into()))
@@ -342,29 +349,34 @@ impl WindowsHelpApp {
                     );
                     ui.label(
                         RichText::new(
-                            "Console locale de supervision, recherche et controle Windows.",
+                            "Recherche locale, supervision système, gestion des processus et suivi thermique dans une seule interface.",
                         )
                         .size(13.0)
                         .color(theme::TEXT_SECONDARY),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
                     ui.horizontal_wrapped(|ui| {
                         theme::status_chip(
                             ui,
-                            format!("IDX {}", search_status.indexed_entries),
+                            format!("INDEX {}", search_status.indexed_entries),
                             theme::ORANGE,
                         );
+                        theme::status_chip(ui, format!("PROC {}", process_count), theme::CYAN);
                         theme::status_chip(
                             ui,
-                            format!("ROOTS {}", search_status.watched_roots),
-                            theme::CYAN,
+                            format!("ALERT {}", active_alerts),
+                            if active_alerts == 0 {
+                                theme::ORANGE_SOFT
+                            } else {
+                                theme::RED
+                            },
                         );
                     });
                 });
 
                 ui.add_space(10.0);
-                theme::panel_card(theme::RED_SOFT).show(ui, |ui| {
-                    theme::section_header(ui, "Navigation", "Modules actifs");
+                theme::panel_card(theme::CYAN).show(ui, |ui| {
+                    theme::section_header(ui, "Navigation", "Modules du poste de commande");
                     for (prefix, view) in [
                         ("01", View::Search),
                         ("02", View::Processes),
@@ -380,17 +392,124 @@ impl WindowsHelpApp {
                 });
 
                 ui.add_space(10.0);
-                theme::panel_card(theme::CYAN).show(ui, |ui| {
-                    theme::section_header(ui, "Systeme", "Telemetrie de la session");
+                theme::panel_card(theme::ORANGE_SOFT).show(ui, |ui| {
+                    theme::section_header(ui, "État de session", "Services actifs et cadence");
                     ui.horizontal_wrapped(|ui| {
                         theme::status_chip(
                             ui,
-                            format!("PROC {}", process_count),
+                            format!("ROOTS {}", search_status.watched_roots),
+                            theme::CYAN,
+                        );
+                        theme::status_chip(
+                            ui,
+                            format!("PROC {} ms", self.settings.process_refresh_ms),
                             theme::ORANGE_SOFT,
                         );
                         theme::status_chip(
                             ui,
-                            format!("ALERT {}", active_alerts),
+                            format!("MON {} ms", self.settings.monitor_refresh_ms),
+                            theme::ORANGE_SOFT,
+                        );
+                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Racines surveillées : {}",
+                            search_status.watched_roots
+                        ))
+                        .color(theme::TEXT_PRIMARY),
+                    );
+                    ui.label(
+                        RichText::new(format!("Processus suivis : {process_count}"))
+                        .color(theme::TEXT_PRIMARY),
+                    );
+                    if search_status.is_indexing {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("Indexation en cours sur la machine.")
+                                .color(theme::ORANGE),
+                        );
+                    }
+                    if !search_status.snapshot_loaded && search_status.indexed_entries > 0 {
+                        ui.label(
+                            RichText::new("Le snapshot de recherche est en cours de chargement.")
+                                .size(12.0)
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                    }
+                    if let Some(error) = search_status.last_error.as_deref() {
+                        ui.add_space(8.0);
+                        theme::banner_frame(theme::RED).show(ui, |ui| {
+                            ui.label(RichText::new(error).color(theme::TEXT_PRIMARY));
+                        });
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                theme::banner_frame(theme::BORDER).show(ui, |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Mode local uniquement : pas de cloud, pas de service distant, tout est traité sur la machine.",
+                        )
+                        .size(12.0)
+                        .color(theme::TEXT_SECONDARY),
+                    );
+                });
+            });
+    }
+    fn show_top_bar(&mut self, ctx: &egui::Context, active_alerts: usize) {
+        egui::TopBottomPanel::top("top-bar")
+            .frame(theme::topbar_frame())
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "MODULE // {}",
+                                self.current_view.label().to_uppercase()
+                            ))
+                            .monospace()
+                            .size(12.0)
+                            .color(theme::ORANGE),
+                        );
+                        ui.label(
+                            RichText::new(self.current_view.label())
+                                .text_style(egui::TextStyle::Heading)
+                                .color(theme::TEXT_PRIMARY),
+                        );
+                        ui.label(
+                            RichText::new(self.current_view.description())
+                                .size(13.0)
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        theme::status_chip(
+                            ui,
+                            format!("LOCAL {}", Local::now().format("%H:%M:%S")),
+                            theme::CYAN,
+                        );
+                        theme::status_chip(
+                            ui,
+                            format!("MONITOR {} ms", self.settings.monitor_refresh_ms),
+                            theme::ORANGE_SOFT,
+                        );
+                        theme::status_chip(
+                            ui,
+                            format!("PROC {} ms", self.settings.process_refresh_ms),
+                            theme::CYAN,
+                        );
+                        theme::status_chip(
+                            ui,
+                            format!(
+                                "ALERTES {}",
+                                if active_alerts == 0 {
+                                    "OK".to_owned()
+                                } else {
+                                    active_alerts.to_string()
+                                }
+                            ),
                             if active_alerts == 0 {
                                 theme::ORANGE_SOFT
                             } else {
@@ -398,82 +517,14 @@ impl WindowsHelpApp {
                             },
                         );
                     });
-                    ui.add_space(8.0);
-                    if search_status.is_indexing {
-                        theme::status_chip(ui, "INDEX EN COURS", theme::ORANGE);
-                        ui.add_space(8.0);
-                    }
-                    ui.label(
-                        RichText::new(format!(
-                            "Elements indexes : {}",
-                            search_status.indexed_entries
-                        ))
-                        .color(theme::TEXT_PRIMARY),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "Racines surveillees : {}",
-                            search_status.watched_roots
-                        ))
-                        .color(theme::TEXT_PRIMARY),
-                    );
-                    ui.label(
-                        RichText::new(format!("Processus suivis : {process_count}"))
-                            .color(theme::TEXT_PRIMARY),
-                    );
-                    if let Some(error) = search_status.last_error.as_deref() {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(error).size(12.0).color(theme::RED));
-                    }
                 });
-            });
-    }
-    fn show_top_bar(&mut self, ctx: &egui::Context, active_alerts: usize) {
-        egui::TopBottomPanel::top("top-bar")
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG_PANEL_ALT)
-                    .inner_margin(egui::Margin::symmetric(18, 10))
-                    .stroke(Stroke::new(2.0, theme::ORANGE_SOFT)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!("VIEW // {}", self.current_view.label()))
-                            .monospace()
-                            .size(13.0)
-                            .color(theme::ORANGE),
-                    );
-                    theme::status_chip(
-                        ui,
-                        format!(
-                            "ALERTES {}",
-                            if active_alerts == 0 {
-                                "AUCUNE".to_owned()
-                            } else {
-                                active_alerts.to_string()
-                            }
-                        ),
-                        if active_alerts == 0 {
-                            theme::ORANGE_SOFT
-                        } else {
-                            theme::RED
-                        },
-                    );
-                    theme::status_chip(
-                        ui,
-                        format!("LOCAL {}", Local::now().format("%H:%M:%S")),
-                        theme::CYAN,
-                    );
-                    theme::status_chip(
-                        ui,
-                        format!("MONITOR {} ms", self.settings.monitor_refresh_ms),
-                        theme::ORANGE_SOFT,
-                    );
-                    if let Some(message) = &self.status_message {
-                        theme::status_chip(ui, message.clone(), theme::ORANGE);
-                    }
-                });
+
+                if let Some(message) = &self.status_message {
+                    ui.add_space(10.0);
+                    theme::banner_frame(theme::ORANGE).show(ui, |ui| {
+                        ui.label(RichText::new(message).color(theme::TEXT_PRIMARY));
+                    });
+                }
             });
     }
     fn show_search_view(&mut self, ui: &mut egui::Ui) {
@@ -1308,12 +1359,15 @@ impl WindowsHelpApp {
     }
 }
 impl eframe::App for WindowsHelpApp {
+    /// Fond opaque de la fenêtre native.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG_GRAPHITE.to_normalized_gamma_f32()
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(250));
+
+        // Fond global simple et sûr.
         theme::paint_app_background(ctx);
 
         let monitor_state = self.monitor_service.snapshot_state();
@@ -1323,14 +1377,9 @@ impl eframe::App for WindowsHelpApp {
         self.show_top_bar(ctx, active_alerts.len());
 
         egui::TopBottomPanel::bottom("active-alerts")
-            .resizable(true)
-            .default_height(100.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG_PANEL_ALT)
-                    .inner_margin(egui::Margin::symmetric(18, 12))
-                    .stroke(Stroke::new(2.0, theme::ORANGE_SOFT)),
-            )
+            .resizable(false)
+            .default_height(82.0)
+            .frame(theme::topbar_frame())
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
@@ -1348,27 +1397,39 @@ impl eframe::App for WindowsHelpApp {
                 ui.add_space(6.0);
                 if active_alerts.is_empty() {
                     ui.label(
-                        RichText::new("Aucune alerte persistante.").color(theme::TEXT_SECONDARY),
+                        RichText::new("Aucune alerte persistante sur le poste.")
+                            .color(theme::TEXT_SECONDARY),
                     );
                 } else {
-                    for event in active_alerts.iter().take(5) {
+                    for event in active_alerts.iter().take(3) {
                         ui.label(
                             RichText::new(format!("{} // {}", event.source_label, event.message))
                                 .color(theme::RED),
+                        );
+                    }
+
+                    if active_alerts.len() > 3 {
+                        ui.label(
+                            RichText::new(format!(
+                                "+ {} autres alertes actives",
+                                active_alerts.len() - 3
+                            ))
+                            .size(12.0)
+                            .color(theme::TEXT_SECONDARY),
                         );
                     }
                 }
             });
 
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG_PANEL)
-                    .stroke(Stroke::new(2.0, theme::BORDER))
-                    .inner_margin(egui::Margin::same(20)),
-            )
+            .frame(theme::workspace_frame())
             .show(ctx, |ui| {
-                theme::panel_card(theme::ORANGE).show(ui, |ui| {
+                // Important :
+                // le décor "hacker" est maintenant peint dans la zone centrale,
+                // donc il reste derrière les widgets.
+                theme::paint_workspace_background(ui);
+
+                theme::workspace_content_frame().show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| match self.current_view {
@@ -1382,29 +1443,28 @@ impl eframe::App for WindowsHelpApp {
             });
 
         if let Some((pid, name)) = self.confirm_kill.clone() {
-            egui::Window::new("Confirmer l'arret")
+            egui::Window::new("Confirmer l'arrêt")
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .collapsible(false)
                 .resizable(false)
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::BG_PANEL_ALT)
-                        .inner_margin(egui::Margin::same(18))
-                        .corner_radius(CornerRadius::same(18))
-                        .stroke(Stroke::new(1.0, theme::RED))
-                        .shadow(egui::Shadow {
-                            offset: [0, 12],
-                            blur: 26,
-                            spread: 0,
-                            color: Color32::from_rgba_unmultiplied(0, 0, 0, 120),
-                        }),
-                )
+                .frame(theme::panel_card(theme::RED))
                 .show(ctx, |ui| {
                     ui.label(
                         RichText::new(format!("Terminer {name} ({pid}) ?"))
                             .color(theme::TEXT_PRIMARY),
                     );
                     ui.add_space(8.0);
+
+                    ui.label(
+                        RichText::new(
+                            "Cette action est immédiate et le processus sera stoppé côté Windows.",
+                        )
+                        .size(12.0)
+                        .color(theme::TEXT_SECONDARY),
+                    );
+
+                    ui.add_space(10.0);
+
                     ui.horizontal(|ui| {
                         if ui.button("Annuler").clicked() {
                             self.confirm_kill = None;
@@ -1416,11 +1476,11 @@ impl eframe::App for WindowsHelpApp {
                             {
                                 Ok(()) => {
                                     self.status_message =
-                                        Some(format!("Processus {name} ({pid}) termine."));
+                                        Some(format!("Processus {name} ({pid}) terminé."));
                                 }
                                 Err(error) => {
                                     self.status_message =
-                                        Some(format!("Echec de la terminaison : {error}"));
+                                        Some(format!("Échec de la terminaison : {error}"));
                                 }
                             }
                             self.confirm_kill = None;
@@ -1464,14 +1524,14 @@ pub fn run() -> anyhow::Result<()> {
 
 fn nav_button(ui: &mut egui::Ui, prefix: &str, label: &str, active: bool) -> bool {
     let fill = if active {
-        Color32::from_rgb(86, 49, 34)
+        theme::BG_SURFACE
     } else {
         theme::BG_PANEL_ALT
     };
     let stroke = if active {
         theme::ORANGE
     } else {
-        theme::BORDER.gamma_multiply(1.15)
+        theme::BORDER.gamma_multiply(0.9)
     };
     let text_color = if active {
         theme::TEXT_PRIMARY
@@ -1479,10 +1539,10 @@ fn nav_button(ui: &mut egui::Ui, prefix: &str, label: &str, active: bool) -> boo
         theme::TEXT_SECONDARY
     };
 
-    ui.add_sized(
-        [ui.available_width(), 42.0],
+    let response = ui.add_sized(
+        [ui.available_width(), 44.0],
         egui::Button::new(
-            RichText::new(format!("{prefix} // {label}"))
+            RichText::new(format!("{prefix}   {label}"))
                 .monospace()
                 .size(14.0)
                 .color(text_color),
@@ -1490,29 +1550,61 @@ fn nav_button(ui: &mut egui::Ui, prefix: &str, label: &str, active: bool) -> boo
         .fill(fill)
         .stroke(Stroke::new(1.0, stroke))
         .corner_radius(CornerRadius::same(16)),
-    )
-    .clicked()
+    );
+
+    if active {
+        let indicator = egui::Rect::from_min_size(
+            response.rect.min + egui::vec2(6.0, 8.0),
+            egui::vec2(4.0, response.rect.height() - 16.0),
+        );
+
+        ui.painter()
+            .rect_filled(indicator, CornerRadius::same(255), theme::ORANGE);
+    }
+
+    response.clicked()
 }
 
 fn metric_card(ui: &mut egui::Ui, title: &str, value: String, subtitle: &str, tone: CardTone) {
+    let accent = match tone {
+        CardTone::Default => theme::ORANGE_SOFT,
+        CardTone::Accent => theme::ORANGE,
+        CardTone::Warning => theme::WARNING,
+        CardTone::Danger => theme::RED,
+        CardTone::Info => theme::CYAN,
+    };
+
     theme::metric_card_variant(tone).show(ui, |ui| {
-        ui.set_min_size(Vec2::new(215.0, 96.0));
+        ui.set_min_size(Vec2::new(220.0, 104.0));
         ui.label(
             RichText::new(title)
                 .monospace()
                 .size(12.0)
                 .color(theme::TEXT_SECONDARY),
         );
+        ui.add_space(2.0);
         ui.label(
             RichText::new(value)
                 .text_style(egui::TextStyle::Name("Metric".into()))
                 .color(theme::TEXT_PRIMARY),
         );
+        ui.add_space(2.0);
         ui.label(
             RichText::new(subtitle)
                 .size(12.0)
                 .color(theme::TEXT_SECONDARY),
         );
+
+        let width = ui.available_width().max(42.0);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 8.0), egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+
+        let bar = egui::Rect::from_min_size(
+            egui::pos2(rect.left(), rect.center().y - 1.0),
+            egui::vec2(rect.width() * 0.42, 2.0),
+        );
+
+        painter.rect_filled(bar, CornerRadius::same(255), accent.gamma_multiply(0.95));
     });
 }
 
@@ -1521,12 +1613,12 @@ fn temperature_card(ui: &mut egui::Ui, reading: &TemperatureReading) {
     let tone = thermal_state_tone(reading.state);
 
     theme::metric_card_variant(tone).show(ui, |ui| {
-        ui.set_min_size(Vec2::new(228.0, 138.0));
+        ui.set_min_size(Vec2::new(236.0, 148.0));
         ui.horizontal_wrapped(|ui| {
             theme::status_chip(ui, reading.kind.label(), accent);
             theme::status_chip(ui, reading.state.label(), accent);
         });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         ui.label(
             RichText::new(&reading.name)
                 .size(14.0)
@@ -1536,7 +1628,7 @@ fn temperature_card(ui: &mut egui::Ui, reading: &TemperatureReading) {
             RichText::new(
                 reading
                     .temperature_celsius
-                    .map(|value| format!("{value:.1} C"))
+                    .map(|value| format!("{value:.1} °C"))
                     .unwrap_or_else(|| "Indisponible".into()),
             )
             .text_style(egui::TextStyle::Name("Metric".into()))
@@ -1554,7 +1646,7 @@ fn temperature_card(ui: &mut egui::Ui, reading: &TemperatureReading) {
             reading.critical_limit_celsius,
         ) {
             ui.label(
-                RichText::new(format!("Seuils : {warning:.0} / {critical:.0} C"))
+                RichText::new(format!("Seuils : {warning:.0} / {critical:.0} °C"))
                     .size(12.0)
                     .color(theme::TEXT_SECONDARY),
             );
@@ -1603,11 +1695,23 @@ fn process_metric_grid(ui: &mut egui::Ui, metrics: &[ProcessMetric], show_cpu: b
                         .color(theme::TEXT_SECONDARY),
                 );
                 if show_cpu {
-                    ui.label(format!("{:.1}", metric.cpu));
+                    ui.label(
+                        RichText::new(format!("{:.1}", metric.cpu))
+                            .monospace()
+                            .color(theme::TEXT_PRIMARY),
+                    );
                 } else {
-                    ui.label(format_bytes(metric.memory_bytes));
+                    ui.label(
+                        RichText::new(format_bytes(metric.memory_bytes))
+                            .monospace()
+                            .color(theme::TEXT_PRIMARY),
+                    );
                 }
-                ui.label(format!("{:.1}", metric.memory_percent));
+                ui.label(
+                    RichText::new(format!("{:.1}", metric.memory_percent))
+                        .monospace()
+                        .color(theme::TEXT_SECONDARY),
+                );
                 ui.end_row();
             }
         });
@@ -1620,22 +1724,28 @@ fn draw_line_chart(
     max_value: f32,
     color: Color32,
 ) {
-    ui.label(
-        RichText::new(title)
-            .monospace()
-            .size(12.0)
-            .color(theme::TEXT_SECONDARY),
-    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(title)
+                .monospace()
+                .size(12.0)
+                .color(theme::TEXT_SECONDARY),
+        );
 
-    let desired_size = Vec2::new(ui.available_width(), 136.0);
+        if let Some(last) = values.last() {
+            theme::status_chip(ui, format!("{last:.1}"), color);
+        }
+    });
+
+    let desired_size = Vec2::new(ui.available_width(), 150.0);
     let (rect, _) = ui.allocate_exact_size(desired_size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
 
-    painter.rect_filled(rect, CornerRadius::same(14), theme::BG_PANEL_ALT);
+    painter.rect_filled(rect, CornerRadius::same(14), theme::BG_PANEL);
     painter.rect_stroke(
         rect,
         CornerRadius::same(14),
-        Stroke::new(1.0, theme::BORDER.gamma_multiply(1.1)),
+        Stroke::new(1.0, theme::BORDER.gamma_multiply(0.9)),
         egui::StrokeKind::Outside,
     );
 
@@ -1667,15 +1777,30 @@ fn draw_line_chart(
         })
         .collect::<Vec<_>>();
 
+    let mut fill_points = Vec::with_capacity(points.len() + 2);
+    fill_points.push(egui::pos2(rect.left(), rect.bottom()));
+    fill_points.extend(points.iter().copied());
+    fill_points.push(egui::pos2(rect.right(), rect.bottom()));
+
+    painter.add(egui::Shape::convex_polygon(
+        fill_points,
+        color.gamma_multiply(0.10),
+        Stroke::new(0.0, Color32::TRANSPARENT),
+    ));
+
     painter.add(egui::Shape::line(
         points.clone(),
-        Stroke::new(6.0, color.gamma_multiply(0.18)),
+        Stroke::new(6.0, color.gamma_multiply(0.15)),
     ));
-    painter.add(egui::Shape::line(points.clone(), Stroke::new(2.5, color)));
+    painter.add(egui::Shape::line(points.clone(), Stroke::new(2.0, color)));
 
     let marker_stride = (points.len() / 6).max(1);
     for point in points.iter().step_by(marker_stride) {
-        painter.circle_filled(*point, 2.5, color);
+        painter.circle_filled(*point, 2.6, color);
+    }
+
+    if let Some(last_point) = points.last() {
+        painter.circle_filled(*last_point, 4.0, color);
     }
 }
 
@@ -1722,5 +1847,100 @@ fn percent(value: u64, total: u64) -> f32 {
         0.0
     } else {
         (value as f64 / total as f64 * 100.0) as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::monitor::{AlertEvent, AlertEventKind, AlertEventState};
+
+    #[test]
+    fn view_descriptions_match_expected_modules() {
+        let cases = [
+            (View::Search, "Recherche", "index local"),
+            (View::Processes, "Processus", "processus Windows"),
+            (View::Monitor, "Surveillance", "temps réel"),
+            (View::Temperatures, "Temperatures", "thermique"),
+            (View::Settings, "Paramètres", "Configuration"),
+        ];
+
+        for (view, label, description_fragment) in cases {
+            assert_eq!(view.label(), label);
+            assert!(
+                view.description().contains(description_fragment),
+                "description for {label} should contain {description_fragment:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_bytes_scales_values() {
+        assert_eq!(format_bytes(512), "512.0 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+    }
+
+    #[test]
+    fn percent_handles_zero_total() {
+        assert_eq!(percent(10, 0), 0.0);
+        assert!((percent(25, 200) - 12.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn active_alerts_keep_latest_persistent_active_events() {
+        let events = vec![
+            AlertEvent {
+                kind: AlertEventKind::MetricThreshold,
+                rule_id: "cpu".into(),
+                source_label: "CPU".into(),
+                message: "first".into(),
+                state: AlertEventState::Active,
+                value_percent: 95.0,
+                threshold_percent: 90.0,
+                triggered_at_utc: 1,
+                resolved_at_utc: None,
+            },
+            AlertEvent {
+                kind: AlertEventKind::MetricThreshold,
+                rule_id: "cpu".into(),
+                source_label: "CPU".into(),
+                message: "latest".into(),
+                state: AlertEventState::Active,
+                value_percent: 97.0,
+                threshold_percent: 90.0,
+                triggered_at_utc: 2,
+                resolved_at_utc: None,
+            },
+            AlertEvent {
+                kind: AlertEventKind::CoolingActionApplied,
+                rule_id: "cooling".into(),
+                source_label: "Fan".into(),
+                message: "transient".into(),
+                state: AlertEventState::Active,
+                value_percent: 0.0,
+                threshold_percent: 0.0,
+                triggered_at_utc: 3,
+                resolved_at_utc: None,
+            },
+            AlertEvent {
+                kind: AlertEventKind::MetricThreshold,
+                rule_id: "memory".into(),
+                source_label: "RAM".into(),
+                message: "resolved".into(),
+                state: AlertEventState::Resolved,
+                value_percent: 91.0,
+                threshold_percent: 90.0,
+                triggered_at_utc: 4,
+                resolved_at_utc: Some(5),
+            },
+        ];
+
+        let mut active_alerts = WindowsHelpApp::active_alerts(&events);
+        active_alerts.sort_by(|left, right| left.rule_id.cmp(&right.rule_id));
+
+        assert_eq!(active_alerts.len(), 1);
+        assert_eq!(active_alerts[0].message, "latest");
+        assert_eq!(active_alerts[0].source_label, "CPU");
     }
 }
