@@ -1261,7 +1261,7 @@ fn format_bytes(value: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
 
     #[test]
     fn safety_classification_is_conservative() {
@@ -1397,33 +1397,49 @@ mod tests {
 
     #[test]
     fn process_state_sees_spawned_process_and_validates_key() -> anyhow::Result<()> {
-        let mut child = Command::new("cmd")
-            .args(["/C", "ping", "127.0.0.1", "-n", "30"])
+        let mut child = Command::new("ping")
+            .args(["127.0.0.1", "-n", "30"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()?;
         let pid = child.id();
 
-        let state = refresh_process_state()?;
-        let row = state
-            .rows
-            .iter()
-            .find(|row| row.key.pid == pid)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("process {pid} not found"))?;
-
-        assert_eq!(row.key.pid, pid);
-        validate_process_key(&row.key)?;
-        set_process_priority(pid, PriorityClass::BelowNormal)?;
-        kill_process(pid)?;
-
-        for _ in 0..20 {
-            if child.try_wait()?.is_some() {
-                return Ok(());
+        let result = (|| -> anyhow::Result<()> {
+            let mut row = None;
+            for _ in 0..30 {
+                let state = refresh_process_state()?;
+                row = state.rows.iter().find(|row| row.key.pid == pid).cloned();
+                if row.is_some() {
+                    break;
+                }
+                if child.try_wait()?.is_some() {
+                    anyhow::bail!("child process {pid} exited before detection");
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            std::thread::sleep(Duration::from_millis(100));
+
+            let row =
+                row.ok_or_else(|| anyhow::anyhow!("process {pid} not found after retries"))?;
+            assert_eq!(row.key.pid, pid);
+            validate_process_key(&row.key)?;
+            set_process_priority(pid, PriorityClass::BelowNormal)?;
+            kill_process(pid)?;
+
+            for _ in 0..20 {
+                if child.try_wait()?.is_some() {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+
+            anyhow::bail!("child process {pid} was not terminated in time")
+        })();
+
+        if child.try_wait()?.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
 
-        let _ = child.kill();
-        let _ = child.wait();
-        anyhow::bail!("child process {pid} was not terminated in time")
+        result
     }
 }
