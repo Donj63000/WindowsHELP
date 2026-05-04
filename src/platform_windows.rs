@@ -7,7 +7,7 @@ use std::process::Command;
 
 use anyhow::{Context, anyhow};
 use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
+    CloseHandle, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM,
 };
 use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -22,13 +22,23 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GetWindow, GetWindowThreadProcessId, IsWindowVisible, PostMessageW,
-    WM_CLOSE,
+    SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW, WM_CLOSE,
 };
 use windows::core::{BOOL, PCWSTR};
 
 const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
 const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
 const DRIVE_TYPE_FIXED: u32 = 3;
+const MAX_TOAST_TITLE_CHARS: usize = 120;
+const MAX_TOAST_BODY_CHARS: usize = 420;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorkArea {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum PriorityClass {
@@ -103,6 +113,33 @@ pub fn list_fixed_drive_roots() -> Vec<PathBuf> {
     roots
 }
 
+pub fn primary_work_area() -> Option<WorkArea> {
+    let mut rect = RECT::default();
+    // SAFETY: SPI_GETWORKAREA writes a RECT to the provided pointer and does not retain it.
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some((&mut rect as *mut RECT).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+        .ok()?;
+    }
+
+    let width = rect.right.saturating_sub(rect.left);
+    let height = rect.bottom.saturating_sub(rect.top);
+    (width > 0 && height > 0).then_some(WorkArea {
+        left: rect.left as f32,
+        top: rect.top as f32,
+        width: width as f32,
+        height: height as f32,
+    })
+}
+
+pub fn primary_work_area_size() -> Option<(f32, f32)> {
+    primary_work_area().map(|area| (area.width, area.height))
+}
+
 pub fn metadata_attributes(metadata: &std::fs::Metadata) -> u32 {
     metadata.file_attributes()
 }
@@ -116,7 +153,8 @@ pub fn is_system(attributes: u32) -> bool {
 }
 
 pub fn open_path(path: &Path) -> anyhow::Result<()> {
-    Command::new("explorer")
+    ensure_existing_path(path)?;
+    Command::new(explorer_executable())
         .arg(path)
         .spawn()
         .with_context(|| format!("échec de l'ouverture de {}", path.display()))?;
@@ -124,8 +162,9 @@ pub fn open_path(path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn reveal_in_explorer(path: &Path) -> anyhow::Result<()> {
+    ensure_existing_path(path)?;
     let argument = format!("/select,{}", path.display());
-    Command::new("explorer")
+    Command::new(explorer_executable())
         .arg(argument)
         .spawn()
         .with_context(|| {
@@ -138,10 +177,12 @@ pub fn reveal_in_explorer(path: &Path) -> anyhow::Result<()> {
 }
 
 pub fn show_toast_notification(title: &str, body: &str) -> anyhow::Result<()> {
+    let title = sanitize_xml_text(title, MAX_TOAST_TITLE_CHARS);
+    let body = sanitize_xml_text(body, MAX_TOAST_BODY_CHARS);
     let xml = format!(
         "<toast><visual><binding template='ToastGeneric'><text>{}</text><text>{}</text></binding></visual></toast>",
-        escape_xml(title),
-        escape_xml(body)
+        escape_xml(&title),
+        escape_xml(&body)
     );
     let script = format!(
         "$ErrorActionPreference='Stop'; \
@@ -154,7 +195,7 @@ pub fn show_toast_notification(title: &str, body: &str) -> anyhow::Result<()> {
         escape_powershell_single_quoted(&xml)
     );
 
-    Command::new("powershell")
+    Command::new(powershell_executable())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -166,6 +207,35 @@ pub fn show_toast_notification(title: &str, body: &str) -> anyhow::Result<()> {
         .spawn()
         .context("echec de l'envoi de la notification toast Windows")?;
     Ok(())
+}
+
+fn ensure_existing_path(path: &Path) -> anyhow::Result<()> {
+    match path.try_exists() {
+        Ok(true) => Ok(()),
+        Ok(false) => anyhow::bail!("chemin introuvable: {}", path.display()),
+        Err(error) => {
+            Err(error).with_context(|| format!("impossible de verifier {}", path.display()))
+        }
+    }
+}
+
+fn explorer_executable() -> PathBuf {
+    windows_root().join("explorer.exe")
+}
+
+fn powershell_executable() -> PathBuf {
+    windows_root()
+        .join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
+}
+
+fn windows_root() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
 }
 
 fn with_process_handle<T, F>(
@@ -365,6 +435,41 @@ fn escape_xml(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
+fn sanitize_xml_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .filter(|character| is_valid_xml_text_char(*character))
+        .take(max_chars)
+        .collect()
+}
+
+fn is_valid_xml_text_char(character: char) -> bool {
+    matches!(
+        character,
+        '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}'
+    )
+}
+
 fn escape_powershell_single_quoted(value: &str) -> String {
     value.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toast_text_is_bounded_and_xml_safe() {
+        let value = format!("ok{}\u{0}<", "x".repeat(MAX_TOAST_TITLE_CHARS + 10));
+        let sanitized = sanitize_xml_text(&value, MAX_TOAST_TITLE_CHARS);
+
+        assert_eq!(sanitized.chars().count(), MAX_TOAST_TITLE_CHARS);
+        assert!(!sanitized.contains('\u{0}'));
+        assert!(escape_xml("<tag>&value").contains("&lt;tag&gt;&amp;value"));
+    }
+
+    #[test]
+    fn powershell_arguments_escape_single_quotes() {
+        assert_eq!(escape_powershell_single_quoted("a'b"), "a''b");
+    }
 }

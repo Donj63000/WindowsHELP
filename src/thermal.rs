@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sysinfo::Components;
 
+const MAX_ACER_PAYLOAD_BYTES: usize = 16 * 1024;
+const MAX_ACER_RESPONSE_BYTES: usize = 256 * 1024;
+const MIN_TEMPERATURE_CELSIUS: f32 = 0.0;
+const MAX_TEMPERATURE_CELSIUS: f32 = 150.0;
+const MAX_FAN_SPEED_RPM: u32 = 50_000;
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ThermalState {
     #[default]
@@ -159,7 +165,26 @@ pub struct ThermalThresholdPair {
 
 impl ThermalThresholdPair {
     pub fn is_valid(&self) -> bool {
-        self.warning_celsius >= 0.0 && self.critical_celsius > self.warning_celsius
+        self.warning_celsius.is_finite()
+            && self.critical_celsius.is_finite()
+            && self.warning_celsius >= MIN_TEMPERATURE_CELSIUS
+            && self.critical_celsius <= MAX_TEMPERATURE_CELSIUS
+            && self.critical_celsius > self.warning_celsius
+    }
+
+    fn sanitized_or(&self, fallback: Self) -> Self {
+        if self.is_valid() {
+            Self {
+                warning_celsius: self
+                    .warning_celsius
+                    .clamp(MIN_TEMPERATURE_CELSIUS, MAX_TEMPERATURE_CELSIUS),
+                critical_celsius: self
+                    .critical_celsius
+                    .clamp(MIN_TEMPERATURE_CELSIUS, MAX_TEMPERATURE_CELSIUS),
+            }
+        } else {
+            fallback
+        }
     }
 }
 
@@ -178,7 +203,7 @@ impl Default for ThermalSettings {
         Self {
             enabled: true,
             notifications_enabled: true,
-            auto_cooling_enabled: true,
+            auto_cooling_enabled: false,
             threshold_mode: ThermalThresholdMode::Auto,
             cpu_thresholds: ThermalThresholdPair {
                 warning_celsius: 85.0,
@@ -189,6 +214,14 @@ impl Default for ThermalSettings {
                 critical_celsius: 95.0,
             },
         }
+    }
+}
+
+impl ThermalSettings {
+    pub fn sanitize(&mut self) {
+        let fallback = Self::default();
+        self.cpu_thresholds = self.cpu_thresholds.sanitized_or(fallback.cpu_thresholds);
+        self.gpu_thresholds = self.gpu_thresholds.sanitized_or(fallback.gpu_thresholds);
     }
 }
 
@@ -256,10 +289,14 @@ pub fn thresholds_for_reading(
 }
 
 pub fn auto_thresholds_for_reading(reading: &TemperatureReading) -> ThermalThresholds {
-    if let Some(hardware_critical) = reading.critical_temperature_celsius {
+    if let Some(hardware_critical) = reading
+        .critical_temperature_celsius
+        .filter(|value| value.is_finite() && *value >= 20.0)
+    {
+        let warning_celsius = (hardware_critical - 10.0).max(0.0);
         return ThermalThresholds {
-            warning_celsius: (hardware_critical - 10.0).max(0.0),
-            critical_celsius: (hardware_critical - 5.0).max(0.0),
+            warning_celsius,
+            critical_celsius: (hardware_critical - 5.0).max(warning_celsius + 1.0),
         };
     }
     ThermalThresholds {
@@ -358,6 +395,12 @@ impl ThermalManager {
 
     pub fn capabilities(&self) -> ThermalCapabilities {
         self.last_capabilities.clone()
+    }
+}
+
+impl Default for ThermalManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -643,18 +686,15 @@ impl AcerNitroBackend {
                 "Parameter": parameter,
             }),
         )?;
-        if let Some(response) = response
-            && let Some(result) = response.get("result").and_then(Value::as_str)
-            && result != "0"
-        {
-            return Err(anyhow!(
-                "le service Acer a retourne result={result} pour {function}"
-            ));
-        }
-        Ok(())
+        validate_acer_command_response(response.as_ref(), function)
     }
 
     fn send_packet(&self, packet_id: u32, payload: &Value) -> anyhow::Result<Option<Value>> {
+        let payload = payload.to_string();
+        if payload.len() > MAX_ACER_PAYLOAD_BYTES {
+            anyhow::bail!("requete Acer trop volumineuse: {} octets", payload.len());
+        }
+
         let mut stream = TcpStream::connect_timeout(&self.address, Duration::from_millis(700))
             .with_context(|| format!("connexion impossible a {}", self.address))?;
         stream
@@ -670,7 +710,7 @@ impl AcerNitroBackend {
             .write_all(&packet_id.to_le_bytes())
             .context("impossible d'ecrire le packet id Acer")?;
         stream
-            .write_all(payload.to_string().as_bytes())
+            .write_all(payload.as_bytes())
             .with_context(|| format!("impossible d'envoyer la requete Acer {payload}"))?;
 
         let mut buffer = Vec::new();
@@ -679,6 +719,12 @@ impl AcerNitroBackend {
             match stream.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(size) => {
+                    if buffer.len().saturating_add(size) > MAX_ACER_RESPONSE_BYTES {
+                        anyhow::bail!(
+                            "reponse Acer trop volumineuse: plus de {} octets",
+                            MAX_ACER_RESPONSE_BYTES
+                        );
+                    }
                     buffer.extend_from_slice(&chunk[..size]);
                     if serde_json::from_slice::<Value>(&buffer).is_ok() {
                         break;
@@ -711,6 +757,18 @@ impl AcerNitroBackend {
     }
 }
 
+fn validate_acer_command_response(response: Option<&Value>, function: &str) -> anyhow::Result<()> {
+    let response = response.ok_or_else(|| anyhow!("reponse Acer vide pour {function}"))?;
+    let result = response
+        .get("result")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("reponse Acer sans resultat pour {function}"))?;
+    if result != "0" {
+        anyhow::bail!("le service Acer a retourne result={result} pour {function}");
+    }
+    Ok(())
+}
+
 fn sensor_kind_from_label(label: &str) -> TemperatureSensorKind {
     let upper = label.to_ascii_uppercase();
     if upper.contains("CPU") {
@@ -725,19 +783,31 @@ fn sensor_kind_from_label(label: &str) -> TemperatureSensorKind {
 }
 
 fn value_as_f32(value: Option<&Value>) -> Option<f32> {
-    match value {
-        Some(Value::Number(number)) => number.as_f64().map(|value| value as f32),
+    let parsed = match value {
+        Some(Value::Number(number)) => number.as_f64().and_then(finite_f32),
         Some(Value::String(value)) => value.parse::<f32>().ok(),
         _ => None,
-    }
+    }?;
+    valid_temperature_celsius(parsed)
 }
 
 fn value_as_u32(value: Option<&Value>) -> Option<u32> {
-    match value {
-        Some(Value::Number(number)) => number.as_u64().map(|value| value as u32),
+    let parsed = match value {
+        Some(Value::Number(number)) => number.as_u64().and_then(|value| u32::try_from(value).ok()),
         Some(Value::String(value)) => value.parse::<u32>().ok(),
         _ => None,
-    }
+    }?;
+    (parsed <= MAX_FAN_SPEED_RPM).then_some(parsed)
+}
+
+fn finite_f32(value: f64) -> Option<f32> {
+    let value = value as f32;
+    value.is_finite().then_some(value)
+}
+
+fn valid_temperature_celsius(value: f32) -> Option<f32> {
+    (value.is_finite() && (MIN_TEMPERATURE_CELSIUS..=MAX_TEMPERATURE_CELSIUS).contains(&value))
+        .then_some(value)
 }
 
 pub fn group_temperature_series_by_kind(
@@ -824,6 +894,20 @@ mod tests {
     }
 
     #[test]
+    fn auto_thresholds_ignore_invalid_hardware_critical_values() {
+        for critical in [Some(f32::NAN), Some(5.0)] {
+            let thresholds = auto_thresholds_for_reading(&cpu_reading_with_critical(critical));
+            assert_eq!(
+                thresholds,
+                ThermalThresholds {
+                    warning_celsius: 85.0,
+                    critical_celsius: 95.0,
+                }
+            );
+        }
+    }
+
+    #[test]
     fn next_state_uses_hysteresis_when_leaving_warning_and_critical() {
         let thresholds = ThermalThresholds {
             warning_celsius: 85.0,
@@ -882,5 +966,56 @@ mod tests {
         assert_eq!(action, CoolingAction::TurboMode);
         assert_eq!(controller.fan_max_calls, 1);
         assert_eq!(controller.turbo_calls, 1);
+    }
+
+    #[test]
+    fn acer_value_parsing_rejects_non_finite_and_out_of_range_values() {
+        assert_eq!(value_as_f32(Some(&json!(72.5))), Some(72.5));
+        assert_eq!(value_as_f32(Some(&json!("NaN"))), None);
+        assert_eq!(value_as_f32(Some(&json!(-1.0))), None);
+        assert_eq!(value_as_f32(Some(&json!(151.0))), None);
+        assert_eq!(value_as_u32(Some(&json!(1200))), Some(1200));
+        assert_eq!(value_as_u32(Some(&json!(50_001))), None);
+        assert_eq!(value_as_u32(Some(&json!(u64::from(u32::MAX) + 1))), None);
+    }
+
+    #[test]
+    fn acer_command_response_requires_explicit_success() {
+        let success = json!({ "result": "0" });
+        validate_acer_command_response(Some(&success), "FAN_CONTROL")
+            .expect("result=0 should pass");
+
+        let missing_result = json!({});
+        let failed = json!({ "result": "1" });
+        assert!(validate_acer_command_response(None, "FAN_CONTROL").is_err());
+        assert!(validate_acer_command_response(Some(&missing_result), "FAN_CONTROL").is_err());
+        assert!(validate_acer_command_response(Some(&failed), "FAN_CONTROL").is_err());
+    }
+
+    #[test]
+    fn thermal_settings_default_requires_explicit_auto_cooling_opt_in() {
+        assert!(!ThermalSettings::default().auto_cooling_enabled);
+    }
+
+    #[test]
+    fn thermal_settings_sanitize_restores_invalid_thresholds() {
+        let mut settings = ThermalSettings {
+            cpu_thresholds: ThermalThresholdPair {
+                warning_celsius: 200.0,
+                critical_celsius: 201.0,
+            },
+            gpu_thresholds: ThermalThresholdPair {
+                warning_celsius: f32::NAN,
+                critical_celsius: 95.0,
+            },
+            ..Default::default()
+        };
+
+        settings.sanitize();
+
+        assert_eq!(settings.cpu_thresholds.warning_celsius, 85.0);
+        assert_eq!(settings.cpu_thresholds.critical_celsius, 95.0);
+        assert_eq!(settings.gpu_thresholds.warning_celsius, 85.0);
+        assert_eq!(settings.gpu_thresholds.critical_celsius, 95.0);
     }
 }

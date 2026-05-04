@@ -1,14 +1,15 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
+use sysinfo::{Disks, Networks, System};
 use tokio::runtime::Handle;
 
 use crate::platform_windows::show_toast_notification;
+use crate::process::ProcessState;
 use crate::thermal::{
     CapturedControlState, CoolingActionRecord, TemperatureReading, ThermalAutomationController,
     ThermalCapabilities, ThermalManager, ThermalSettings, ThermalState, ThermalStatusSnapshot,
@@ -194,6 +195,7 @@ pub struct MetricHistory {
 
 impl MetricHistory {
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         Self {
             samples: VecDeque::with_capacity(capacity),
             capacity,
@@ -207,16 +209,23 @@ impl MetricHistory {
         }
     }
 
-    pub fn samples(&self) -> Vec<MetricSnapshot> {
-        self.samples.iter().cloned().collect()
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+        while self.samples.len() > self.capacity {
+            self.samples.pop_front();
+        }
+    }
+
+    pub fn samples(&self) -> Arc<[MetricSnapshot]> {
+        Arc::from(self.samples.iter().cloned().collect::<Vec<_>>())
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct MonitorSnapshotState {
-    pub latest: Option<MetricSnapshot>,
-    pub history: Vec<MetricSnapshot>,
-    pub events: Vec<AlertEvent>,
+    pub latest: Option<Arc<MetricSnapshot>>,
+    pub history: Arc<[MetricSnapshot]>,
+    pub events: Arc<[AlertEvent]>,
     pub last_error: Option<String>,
 }
 
@@ -225,12 +234,20 @@ pub struct MonitorService {
     rules: Arc<RwLock<Vec<AlertRule>>>,
     thermal_settings: Arc<RwLock<ThermalSettings>>,
     refresh_interval: Arc<RwLock<Duration>>,
+    thermal_refresh_interval: Arc<RwLock<Duration>>,
+    history_capacity: Arc<RwLock<usize>>,
+    process_state: Arc<RwLock<ProcessState>>,
 }
 
 #[derive(Default)]
 struct AlertTracker {
     first_exceeded_at: Option<i64>,
     active: bool,
+    rule_id: String,
+    source_label: String,
+    source_pid: Option<u32>,
+    last_value_percent: f32,
+    threshold_percent: f32,
 }
 
 #[derive(Clone)]
@@ -257,13 +274,16 @@ impl MonitorService {
     pub fn new(
         runtime: Handle,
         refresh_interval: Duration,
+        thermal_refresh_interval: Duration,
+        history_capacity: usize,
+        process_state: Arc<RwLock<ProcessState>>,
         rules: Vec<AlertRule>,
         thermal_settings: ThermalSettings,
     ) -> Self {
         let state = Arc::new(Mutex::new(MonitorSnapshotState {
             latest: None,
-            history: Vec::new(),
-            events: Vec::new(),
+            history: Arc::from(Vec::<MetricSnapshot>::new()),
+            events: Arc::from(Vec::<AlertEvent>::new()),
             last_error: None,
         }));
         let service = Self {
@@ -271,6 +291,9 @@ impl MonitorService {
             rules: Arc::new(RwLock::new(rules)),
             thermal_settings: Arc::new(RwLock::new(thermal_settings)),
             refresh_interval: Arc::new(RwLock::new(refresh_interval)),
+            thermal_refresh_interval: Arc::new(RwLock::new(thermal_refresh_interval)),
+            history_capacity: Arc::new(RwLock::new(history_capacity.max(1))),
+            process_state,
         };
         service.spawn_loop(runtime);
         service
@@ -282,8 +305,8 @@ impl MonitorService {
             .map(|guard| guard.clone())
             .unwrap_or(MonitorSnapshotState {
                 latest: None,
-                history: Vec::new(),
-                events: Vec::new(),
+                history: Arc::from(Vec::<MetricSnapshot>::new()),
+                events: Arc::from(Vec::<AlertEvent>::new()),
                 last_error: Some("Etat de la surveillance indisponible".into()),
             })
     }
@@ -306,38 +329,78 @@ impl MonitorService {
         }
     }
 
+    pub fn update_thermal_refresh_interval(&self, thermal_refresh_interval: Duration) {
+        if let Ok(mut guard) = self.thermal_refresh_interval.write() {
+            *guard = thermal_refresh_interval;
+        }
+    }
+
+    pub fn update_history_capacity(&self, history_capacity: usize) {
+        if let Ok(mut guard) = self.history_capacity.write() {
+            *guard = history_capacity.max(1);
+        }
+    }
+
     fn spawn_loop(&self, runtime: Handle) {
         let state = Arc::clone(&self.state);
         let rules = Arc::clone(&self.rules);
         let thermal_settings = Arc::clone(&self.thermal_settings);
         let refresh_interval = Arc::clone(&self.refresh_interval);
+        let thermal_refresh_interval = Arc::clone(&self.thermal_refresh_interval);
+        let history_capacity = Arc::clone(&self.history_capacity);
+        let process_state = Arc::clone(&self.process_state);
 
         runtime.spawn(async move {
-            let mut system = System::new_all();
+            let mut system = System::new();
             let mut disks = Disks::new_with_refreshed_list();
             let mut networks = Networks::new_with_refreshed_list();
-            let mut history = MetricHistory::new(300);
+            let mut history =
+                MetricHistory::new(history_capacity.read().map(|guard| *guard).unwrap_or(180));
+            let mut event_log = Vec::<AlertEvent>::new();
             let mut alert_trackers: HashMap<String, AlertTracker> = HashMap::new();
             let mut thermal_manager = ThermalManager::new();
             let mut thermal_runtime = ThermalRuntimeState::default();
+            let mut last_thermal_at: Option<Instant> = None;
+            let mut last_temperatures = Vec::<TemperatureReading>::new();
+            let mut last_thermal = ThermalStatusSnapshot::default();
 
-            system.refresh_all();
             loop {
                 let current_rules = rules.read().map(|guard| guard.clone()).unwrap_or_default();
                 let current_thermal_settings = thermal_settings
                     .read()
                     .map(|guard| guard.clone())
                     .unwrap_or_default();
+                let current_history_capacity =
+                    history_capacity.read().map(|guard| *guard).unwrap_or(180);
+                history.set_capacity(current_history_capacity);
+                let thermal_interval = thermal_refresh_interval
+                    .read()
+                    .map(|guard| *guard)
+                    .unwrap_or_else(|_| Duration::from_secs(3));
+                let now = Instant::now();
+                let thermal_due = last_thermal_at
+                    .map(|last| now.duration_since(last) >= thermal_interval)
+                    .unwrap_or(true);
 
-                match collect_metrics(
-                    &mut system,
-                    &mut disks,
-                    &mut networks,
-                    &current_thermal_settings,
-                    &mut thermal_manager,
-                    &mut thermal_runtime,
-                ) {
+                let mut collectors = MetricCollectors {
+                    system: &mut system,
+                    disks: &mut disks,
+                    networks: &mut networks,
+                };
+                let mut thermal_context = ThermalCollectionContext {
+                    settings: &current_thermal_settings,
+                    manager: &mut thermal_manager,
+                    runtime: &mut thermal_runtime,
+                    due: thermal_due,
+                    last_temperatures: &mut last_temperatures,
+                    last_thermal: &mut last_thermal,
+                };
+
+                match collect_metrics(&mut collectors, &process_state, &mut thermal_context) {
                     Ok((snapshot, process_metrics, mut thermal_events)) => {
+                        if thermal_due {
+                            last_thermal_at = Some(now);
+                        }
                         history.push(snapshot.clone());
                         let mut metric_events = evaluate_alerts(
                             &current_rules,
@@ -349,13 +412,14 @@ impl MonitorService {
                         maybe_notify_thermal_events(&current_thermal_settings, &metric_events);
 
                         if let Ok(mut guard) = state.lock() {
-                            guard.latest = Some(snapshot);
+                            guard.latest = Some(Arc::new(snapshot));
                             guard.history = history.samples();
-                            guard.events.extend(metric_events);
-                            if guard.events.len() > 150 {
-                                let start = guard.events.len() - 150;
-                                guard.events = guard.events.split_off(start);
+                            event_log.extend(metric_events);
+                            if event_log.len() > 150 {
+                                let start = event_log.len() - 150;
+                                event_log = event_log.split_off(start);
                             }
+                            guard.events = Arc::from(event_log.clone());
                             guard.last_error = None;
                         }
                     }
@@ -376,50 +440,41 @@ impl MonitorService {
     }
 }
 
+struct MetricCollectors<'a> {
+    system: &'a mut System,
+    disks: &'a mut Disks,
+    networks: &'a mut Networks,
+}
+
+struct ThermalCollectionContext<'a> {
+    settings: &'a ThermalSettings,
+    manager: &'a mut ThermalManager,
+    runtime: &'a mut ThermalRuntimeState,
+    due: bool,
+    last_temperatures: &'a mut Vec<TemperatureReading>,
+    last_thermal: &'a mut ThermalStatusSnapshot,
+}
+
 fn collect_metrics(
-    system: &mut System,
-    disks: &mut Disks,
-    networks: &mut Networks,
-    thermal_settings: &ThermalSettings,
-    thermal_manager: &mut ThermalManager,
-    thermal_runtime: &mut ThermalRuntimeState,
+    collectors: &mut MetricCollectors<'_>,
+    process_state: &Arc<RwLock<ProcessState>>,
+    thermal_context: &mut ThermalCollectionContext<'_>,
 ) -> anyhow::Result<(MetricSnapshot, Vec<ProcessMetric>, Vec<AlertEvent>)> {
-    system.refresh_cpu_usage();
-    system.refresh_memory();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    disks.refresh(false);
-    networks.refresh(true);
+    collectors.system.refresh_cpu_usage();
+    collectors.system.refresh_memory();
+    collectors.disks.refresh(false);
+    collectors.networks.refresh(true);
 
     let timestamp_utc = Utc::now().timestamp();
-    let total_memory = system.total_memory();
-    let used_memory = system.used_memory();
+    let total_memory = collectors.system.total_memory();
+    let used_memory = collectors.system.used_memory();
 
-    let mut process_metrics: Vec<ProcessMetric> = system
-        .processes()
-        .iter()
-        .map(|(pid, process)| ProcessMetric {
-            pid: pid.as_u32(),
-            name: process.name().to_string_lossy().to_string(),
-            cpu: process.cpu_usage(),
-            memory_bytes: process.memory(),
-            memory_percent: percent(process.memory(), total_memory),
-        })
-        .collect();
+    let process_metrics = process_metrics_from_state(process_state);
+    let top_cpu_processes = top_processes_by_cpu(&process_metrics, 8);
+    let top_memory_processes = top_processes_by_memory(&process_metrics, 8);
 
-    let mut top_cpu_processes = process_metrics.clone();
-    top_cpu_processes.sort_by(|left, right| {
-        right
-            .cpu
-            .partial_cmp(&left.cpu)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    top_cpu_processes.truncate(8);
-
-    let mut top_memory_processes = process_metrics.clone();
-    top_memory_processes.sort_by(|left, right| right.memory_bytes.cmp(&left.memory_bytes));
-    top_memory_processes.truncate(8);
-
-    let disks_metrics = disks
+    let disks_metrics = collectors
+        .disks
         .list()
         .iter()
         .map(|disk| DiskMetric {
@@ -434,38 +489,55 @@ fn collect_metrics(
         })
         .collect::<Vec<_>>();
 
-    let network_received = networks.values().map(|network| network.received()).sum();
-    let network_transmitted = networks.values().map(|network| network.transmitted()).sum();
+    let network_received = collectors
+        .networks
+        .values()
+        .map(|network| network.received())
+        .sum();
+    let network_transmitted = collectors
+        .networks
+        .values()
+        .map(|network| network.transmitted())
+        .sum();
 
-    let (temperatures, thermal, thermal_events) = match thermal_manager.collect() {
-        Ok(mut collection) => {
-            let (thermal_status, thermal_events) = evaluate_thermal_cycle(
-                timestamp_utc,
-                thermal_settings,
-                &mut collection.readings,
-                collection.capabilities,
-                thermal_runtime,
-                thermal_manager,
-            );
-            (collection.readings, thermal_status, thermal_events)
+    let (temperatures, thermal, thermal_events) = if thermal_context.due {
+        match thermal_context.manager.collect() {
+            Ok(mut collection) => {
+                let (thermal_status, thermal_events) = evaluate_thermal_cycle(
+                    timestamp_utc,
+                    thermal_context.settings,
+                    &mut collection.readings,
+                    collection.capabilities,
+                    thermal_context.runtime,
+                    thermal_context.manager,
+                );
+                *thermal_context.last_temperatures = collection.readings.clone();
+                *thermal_context.last_thermal = thermal_status.clone();
+                (collection.readings, thermal_status, thermal_events)
+            }
+            Err(error) => {
+                thermal_context.runtime.last_error = Some(error.to_string());
+                let thermal_status = build_thermal_status_snapshot(
+                    thermal_context.settings,
+                    thermal_context.manager.capabilities(),
+                    thermal_context.runtime,
+                );
+                *thermal_context.last_temperatures = Vec::new();
+                *thermal_context.last_thermal = thermal_status.clone();
+                (Vec::new(), thermal_status, Vec::new())
+            }
         }
-        Err(error) => {
-            thermal_runtime.last_error = Some(error.to_string());
-            (
-                Vec::new(),
-                build_thermal_status_snapshot(
-                    thermal_settings,
-                    thermal_manager.capabilities(),
-                    thermal_runtime,
-                ),
-                Vec::new(),
-            )
-        }
+    } else {
+        (
+            thermal_context.last_temperatures.clone(),
+            thermal_context.last_thermal.clone(),
+            Vec::new(),
+        )
     };
 
     let snapshot = MetricSnapshot {
         timestamp_utc,
-        cpu_usage_percent: system.global_cpu_usage(),
+        cpu_usage_percent: collectors.system.global_cpu_usage(),
         total_memory_bytes: total_memory,
         used_memory_bytes: used_memory,
         network_received_bytes_per_sec: network_received,
@@ -477,15 +549,79 @@ fn collect_metrics(
         thermal,
     };
 
-    process_metrics.sort_by(|left, right| {
+    Ok((snapshot, process_metrics, thermal_events))
+}
+
+fn top_processes_by_cpu(processes: &[ProcessMetric], limit: usize) -> Vec<ProcessMetric> {
+    top_processes_by(processes, limit, |left, right| {
         right
             .cpu
             .partial_cmp(&left.cpu)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| right.memory_bytes.cmp(&left.memory_bytes))
-    });
+            .then_with(|| left.name.cmp(&right.name))
+    })
+}
 
-    Ok((snapshot, process_metrics, thermal_events))
+fn top_processes_by_memory(processes: &[ProcessMetric], limit: usize) -> Vec<ProcessMetric> {
+    top_processes_by(processes, limit, |left, right| {
+        right
+            .memory_bytes
+            .cmp(&left.memory_bytes)
+            .then_with(|| {
+                right
+                    .cpu
+                    .partial_cmp(&left.cpu)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.name.cmp(&right.name))
+    })
+}
+
+fn top_processes_by(
+    processes: &[ProcessMetric],
+    limit: usize,
+    compare: impl Fn(&ProcessMetric, &ProcessMetric) -> std::cmp::Ordering,
+) -> Vec<ProcessMetric> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut top = Vec::with_capacity(limit.min(processes.len()));
+    for process in processes {
+        if top.len() < limit {
+            top.push(process.clone());
+            top.sort_by(&compare);
+        } else if top
+            .last()
+            .map(|worst| compare(process, worst).is_lt())
+            .unwrap_or(true)
+        {
+            top.pop();
+            top.push(process.clone());
+            top.sort_by(&compare);
+        }
+    }
+    top
+}
+
+fn process_metrics_from_state(process_state: &Arc<RwLock<ProcessState>>) -> Vec<ProcessMetric> {
+    process_state
+        .read()
+        .map(|guard| {
+            guard
+                .rows
+                .iter()
+                .map(|row| ProcessMetric {
+                    pid: row.key.pid,
+                    name: row.name.clone(),
+                    cpu: row.cpu_now,
+                    memory_bytes: row.memory_bytes,
+                    memory_percent: row.insight.memory_percent,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn maybe_notify_thermal_events(settings: &ThermalSettings, events: &[AlertEvent]) {
@@ -563,15 +699,11 @@ fn evaluate_thermal_cycle<C: ThermalAutomationController>(
         reading.critical_limit_celsius = Some(thresholds.critical_celsius);
         seen_sensor_ids.insert(reading.sensor_id.clone());
 
-        let previous_state = if settings.enabled {
-            runtime
-                .sensor_states
-                .get(&reading.sensor_id)
-                .copied()
-                .unwrap_or(ThermalState::Normal)
-        } else {
-            ThermalState::Normal
-        };
+        let previous_state = runtime
+            .sensor_states
+            .get(&reading.sensor_id)
+            .copied()
+            .unwrap_or(ThermalState::Normal);
         let next_state = if settings.enabled {
             next_thermal_state(previous_state, current_temperature, thresholds)
         } else {
@@ -724,15 +856,18 @@ fn evaluate_thermal_cycle<C: ThermalAutomationController>(
         }
     }
 
-    if previous_global_state == ThermalState::Critical
-        && runtime.global_state != ThermalState::Critical
-    {
+    if runtime.control_applied_by_app && runtime.global_state != ThermalState::Critical {
+        let restore_reason = if previous_global_state == ThermalState::Critical {
+            "temperature revenue sous le seuil critique"
+        } else {
+            "restauration precedente a reessayer"
+        };
         maybe_restore_previous_cooling(
             timestamp_utc,
             runtime,
             controller,
             &mut events,
-            "temperature revenue sous le seuil critique",
+            restore_reason,
         );
     }
 
@@ -803,8 +938,7 @@ fn maybe_restore_previous_cooling<C: ThermalAutomationController>(
             });
         }
         Err(error) => {
-            runtime.control_applied_by_app = false;
-            runtime.previous_control_state = None;
+            // Je garde l'etat capture pour pouvoir retenter la restauration au cycle suivant.
             runtime.last_error = Some(format!("echec de la restauration: {error}"));
             events.push(AlertEvent {
                 kind: AlertEventKind::CoolingActionFailed,
@@ -825,6 +959,7 @@ fn maybe_restore_previous_cooling<C: ThermalAutomationController>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_temperature_transition_events(
     events: &mut Vec<AlertEvent>,
     timestamp_utc: i64,
@@ -979,13 +1114,18 @@ fn evaluate_alerts(
         for evaluation in evaluations {
             rule_expected.insert(evaluation.key.clone());
             let tracker = trackers.entry(evaluation.key.clone()).or_default();
+            tracker.rule_id = rule.id.clone();
+            tracker.source_label = evaluation.source_label.clone();
+            tracker.source_pid = evaluation.source_pid;
+            tracker.last_value_percent = evaluation.value_percent;
+            tracker.threshold_percent = evaluation.threshold_percent;
             if evaluation.exceeded {
                 if tracker.first_exceeded_at.is_none() {
                     tracker.first_exceeded_at = Some(now);
                 }
                 if !tracker.active
                     && now.saturating_sub(tracker.first_exceeded_at.unwrap_or(now))
-                        >= rule.sustain_seconds as i64
+                        >= sustain_seconds_i64(rule.sustain_seconds)
                 {
                     tracker.active = true;
                     events.push(AlertEvent {
@@ -1032,28 +1172,16 @@ fn evaluate_alerts(
         }
     }
 
-    let active_rule_ids: HashSet<String> = rules
-        .iter()
-        .filter(|rule| rule.enabled)
-        .map(|rule| rule.id.clone())
-        .collect();
     let keys_to_resolve: Vec<String> = trackers
-        .keys()
-        .filter(|key| {
-            active_rule_ids
-                .iter()
-                .any(|rule_id| key.starts_with(&format!("{rule_id}:")))
+        .iter()
+        .filter(|(key, tracker)| {
+            tracker.active
+                && !expected_keys_by_rule
+                    .get(&tracker.rule_id)
+                    .map(|keys| keys.contains(*key))
+                    .unwrap_or(false)
         })
-        .filter(|key| {
-            let Some((rule_id, _)) = key.split_once(':') else {
-                return false;
-            };
-            !expected_keys_by_rule
-                .get(rule_id)
-                .map(|keys| keys.contains(*key))
-                .unwrap_or(false)
-        })
-        .cloned()
+        .map(|(key, _)| key.clone())
         .collect();
 
     for key in keys_to_resolve {
@@ -1062,24 +1190,37 @@ fn evaluate_alerts(
         {
             tracker.active = false;
             tracker.first_exceeded_at = None;
-            if let Some((rule_id, source_label)) = key.split_once(':') {
-                events.push(AlertEvent {
-                    kind: AlertEventKind::MetricThreshold,
-                    rule_id: rule_id.to_owned(),
-                    source_label: source_label.to_owned(),
-                    source_pid: None,
-                    message: format!("{source_label} est revenu a la normale"),
-                    state: AlertEventState::Resolved,
-                    value_percent: 0.0,
-                    threshold_percent: 0.0,
-                    triggered_at_utc: now,
-                    resolved_at_utc: Some(now),
-                });
-            }
+            events.push(AlertEvent {
+                kind: AlertEventKind::MetricThreshold,
+                rule_id: tracker.rule_id.clone(),
+                source_label: tracker.source_label.clone(),
+                source_pid: tracker.source_pid,
+                message: format!("{} est revenu a la normale", tracker.source_label),
+                state: AlertEventState::Resolved,
+                value_percent: tracker.last_value_percent,
+                threshold_percent: tracker.threshold_percent,
+                triggered_at_utc: now,
+                resolved_at_utc: Some(now),
+            });
         }
     }
 
+    prune_inactive_alert_trackers(trackers, &expected_keys_by_rule);
+
     events
+}
+
+fn prune_inactive_alert_trackers(
+    trackers: &mut HashMap<String, AlertTracker>,
+    expected_keys_by_rule: &HashMap<String, HashSet<String>>,
+) {
+    trackers.retain(|key, tracker| {
+        tracker.active
+            || expected_keys_by_rule
+                .get(&tracker.rule_id)
+                .map(|keys| keys.contains(key))
+                .unwrap_or(false)
+    });
 }
 
 fn build_evaluations(
@@ -1150,9 +1291,18 @@ fn percent(value: u64, total: u64) -> f32 {
     }
 }
 
+fn sustain_seconds_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform_windows::PriorityClass;
+    use crate::process::{
+        ProcessInsight, ProcessKey, ProcessRow, ProcessSafety, ProcessState, ProcessTrend,
+        SuggestedAction,
+    };
     use crate::thermal::{
         CoolingAction, TemperatureSensorKind, TemperatureSource, ThermalThresholdMode,
         ThermalThresholdPair,
@@ -1215,6 +1365,99 @@ mod tests {
         }
     }
 
+    fn process_row_for_metrics(pid: u32, name: &str, cpu: f32, memory_bytes: u64) -> ProcessRow {
+        ProcessRow {
+            key: ProcessKey {
+                pid,
+                started_at: Some(pid as u64),
+            },
+            family_id: name.to_ascii_lowercase(),
+            name: name.to_owned(),
+            path: None,
+            parent_pid: None,
+            cpu_now: cpu,
+            memory_bytes,
+            threads: 1,
+            priority: PriorityClass::Normal,
+            status: "En cours".into(),
+            run_time_secs: 10,
+            has_visible_window: true,
+            insight: ProcessInsight {
+                impact_score: 12,
+                cpu_avg_10s: cpu,
+                cpu_peak_60s: cpu,
+                memory_percent: memory_bytes as f32 / 100.0,
+                disk_io_bytes_per_sec: 0,
+                safety: ProcessSafety::LikelyClosable,
+                suggested_action: SuggestedAction::CloseGracefully,
+                trend: ProcessTrend::Stable,
+                reasons: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn monitor_process_metrics_are_read_from_shared_process_state() {
+        let process_state = Arc::new(RwLock::new(ProcessState {
+            revision: 7,
+            rows: Arc::from(vec![
+                process_row_for_metrics(10, "alpha.exe", 12.5, 2048),
+                process_row_for_metrics(11, "beta.exe", 4.0, 4096),
+            ]),
+            ..ProcessState::default()
+        }));
+
+        let metrics = process_metrics_from_state(&process_state);
+
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].pid, 10);
+        assert_eq!(metrics[0].name, "alpha.exe");
+        assert!((metrics[0].cpu - 12.5).abs() < f32::EPSILON);
+        assert_eq!(metrics[1].memory_bytes, 4096);
+    }
+
+    #[test]
+    fn top_process_helpers_keep_limit_and_order() {
+        let metrics = vec![
+            ProcessMetric {
+                pid: 1,
+                name: "slow.exe".into(),
+                cpu: 1.0,
+                memory_bytes: 900,
+                memory_percent: 1.0,
+            },
+            ProcessMetric {
+                pid: 2,
+                name: "hot.exe".into(),
+                cpu: 40.0,
+                memory_bytes: 100,
+                memory_percent: 2.0,
+            },
+            ProcessMetric {
+                pid: 3,
+                name: "warm.exe".into(),
+                cpu: 20.0,
+                memory_bytes: 2_000,
+                memory_percent: 3.0,
+            },
+        ];
+
+        let top_cpu = top_processes_by_cpu(&metrics, 2);
+        assert_eq!(
+            top_cpu.iter().map(|metric| metric.pid).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+
+        let top_memory = top_processes_by_memory(&metrics, 2);
+        assert_eq!(
+            top_memory
+                .iter()
+                .map(|metric| metric.pid)
+                .collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+    }
+
     fn default_thermal_settings() -> ThermalSettings {
         ThermalSettings {
             enabled: true,
@@ -1264,6 +1507,23 @@ mod tests {
     }
 
     #[test]
+    fn history_keeps_at_least_one_sample_with_zero_capacity() {
+        let mut history = MetricHistory::new(0);
+        history.push(snapshot_with_cpu(1, 10.0));
+        history.push(snapshot_with_cpu(2, 20.0));
+
+        let samples = history.samples();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].timestamp_utc, 2);
+    }
+
+    #[test]
+    fn sustain_seconds_conversion_does_not_wrap() {
+        assert_eq!(sustain_seconds_i64(10), 10);
+        assert_eq!(sustain_seconds_i64(u64::MAX), i64::MAX);
+    }
+
+    #[test]
     fn alerts_debounce_before_triggering_and_then_resolve() {
         let rule = AlertRule {
             id: "system-cpu".into(),
@@ -1276,7 +1536,7 @@ mod tests {
 
         let mut trackers = HashMap::new();
         let no_event = evaluate_alerts(
-            &[rule.clone()],
+            std::slice::from_ref(&rule),
             &snapshot_with_cpu(0, 85.0),
             &[],
             &mut trackers,
@@ -1284,7 +1544,7 @@ mod tests {
         assert!(no_event.is_empty());
 
         let still_no_event = evaluate_alerts(
-            &[rule.clone()],
+            std::slice::from_ref(&rule),
             &snapshot_with_cpu(9, 85.0),
             &[],
             &mut trackers,
@@ -1292,7 +1552,7 @@ mod tests {
         assert!(still_no_event.is_empty());
 
         let active_event = evaluate_alerts(
-            &[rule.clone()],
+            std::slice::from_ref(&rule),
             &snapshot_with_cpu(10, 85.0),
             &[],
             &mut trackers,
@@ -1327,6 +1587,125 @@ mod tests {
         let evaluations = build_evaluations(&rule, &snapshot, &processes);
         assert_eq!(evaluations.len(), 1);
         assert_eq!(evaluations[0].source_pid, Some(42));
+    }
+
+    #[test]
+    fn process_alert_resolves_with_source_pid_when_process_disappears() {
+        let rule = AlertRule {
+            id: "process-cpu".into(),
+            label: "CPU process".into(),
+            enabled: true,
+            kind: AlertRuleKind::ProcessCpu,
+            threshold_percent: 50.0,
+            sustain_seconds: 0,
+        };
+        let mut trackers = HashMap::new();
+        let hot_processes = vec![ProcessMetric {
+            pid: 42,
+            name: "worker.exe".into(),
+            cpu: 75.0,
+            memory_bytes: 10,
+            memory_percent: 1.0,
+        }];
+
+        let active = evaluate_alerts(
+            std::slice::from_ref(&rule),
+            &snapshot_with_cpu(1, 10.0),
+            &hot_processes,
+            &mut trackers,
+        );
+        assert_eq!(active.len(), 1);
+        assert!(matches!(active[0].state, AlertEventState::Active));
+        assert_eq!(active[0].source_pid, Some(42));
+
+        let resolved = evaluate_alerts(&[rule], &snapshot_with_cpu(2, 10.0), &[], &mut trackers);
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(resolved[0].state, AlertEventState::Resolved));
+        assert_eq!(resolved[0].source_pid, Some(42));
+        assert_eq!(resolved[0].source_label, "worker.exe (42)");
+        assert!(trackers.is_empty());
+    }
+
+    #[test]
+    fn inactive_process_alert_trackers_are_pruned_when_process_disappears() {
+        let rule = AlertRule {
+            id: "process-cpu".into(),
+            label: "CPU process".into(),
+            enabled: true,
+            kind: AlertRuleKind::ProcessCpu,
+            threshold_percent: 50.0,
+            sustain_seconds: 10,
+        };
+        let mut trackers = HashMap::new();
+        let hot_processes = vec![ProcessMetric {
+            pid: 42,
+            name: "short-lived.exe".into(),
+            cpu: 75.0,
+            memory_bytes: 10,
+            memory_percent: 1.0,
+        }];
+
+        let pending = evaluate_alerts(
+            std::slice::from_ref(&rule),
+            &snapshot_with_cpu(1, 10.0),
+            &hot_processes,
+            &mut trackers,
+        );
+        assert!(pending.is_empty());
+        assert_eq!(trackers.len(), 1);
+
+        let disappeared = evaluate_alerts(&[rule], &snapshot_with_cpu(2, 10.0), &[], &mut trackers);
+        assert!(disappeared.is_empty());
+        assert!(trackers.is_empty());
+    }
+
+    #[test]
+    fn active_alert_resolves_when_rule_is_disabled_or_removed() {
+        let mut rule = AlertRule {
+            id: "system-cpu".into(),
+            label: "CPU systeme".into(),
+            enabled: true,
+            kind: AlertRuleKind::SystemCpu,
+            threshold_percent: 80.0,
+            sustain_seconds: 0,
+        };
+        let mut trackers = HashMap::new();
+
+        let active = evaluate_alerts(
+            std::slice::from_ref(&rule),
+            &snapshot_with_cpu(1, 85.0),
+            &[],
+            &mut trackers,
+        );
+        assert_eq!(active.len(), 1);
+        assert!(matches!(active[0].state, AlertEventState::Active));
+
+        rule.enabled = false;
+        let resolved = evaluate_alerts(&[rule], &snapshot_with_cpu(2, 85.0), &[], &mut trackers);
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(resolved[0].state, AlertEventState::Resolved));
+        assert_eq!(resolved[0].rule_id, "system-cpu");
+
+        let rule = AlertRule {
+            id: "system-memory".into(),
+            label: "Memoire systeme".into(),
+            enabled: true,
+            kind: AlertRuleKind::SystemMemory,
+            threshold_percent: 5.0,
+            sustain_seconds: 0,
+        };
+        let active = evaluate_alerts(
+            std::slice::from_ref(&rule),
+            &snapshot_with_cpu(3, 10.0),
+            &[],
+            &mut trackers,
+        );
+        assert_eq!(active.len(), 1);
+
+        let resolved = evaluate_alerts(&[], &snapshot_with_cpu(4, 10.0), &[], &mut trackers);
+        assert_eq!(resolved.len(), 1);
+        assert!(matches!(resolved[0].state, AlertEventState::Resolved));
+        assert_eq!(resolved[0].rule_id, "system-memory");
     }
 
     #[test]
@@ -1463,6 +1842,130 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event.kind, AlertEventKind::CoolingActionFailed))
+        );
+    }
+
+    #[test]
+    fn thermal_cycle_resolves_active_sensor_when_monitoring_is_disabled() {
+        let mut settings = default_thermal_settings();
+        settings.enabled = false;
+        let mut runtime = ThermalRuntimeState {
+            sensor_states: HashMap::from([("cpu".into(), ThermalState::Critical)]),
+            global_state: ThermalState::Critical,
+            previous_control_state: None,
+            control_applied_by_app: false,
+            last_action: None,
+            last_error: None,
+        };
+        let mut controller = MockThermalController {
+            control_available: true,
+            capture_calls: 0,
+            apply_calls: 0,
+            restore_calls: 0,
+            captured_state: None,
+            apply_result: Ok(CoolingAction::FanMax),
+            restore_result: Ok(CoolingAction::TurboMode),
+        };
+
+        let mut readings = vec![cpu_temperature(80.0)];
+        let (status, events) = evaluate_thermal_cycle(
+            20,
+            &settings,
+            &mut readings,
+            ThermalCapabilities {
+                source: TemperatureSource::AcerNitro,
+                read_supported: true,
+                control_supported: true,
+                fan_control_supported: true,
+                operating_mode_supported: true,
+            },
+            &mut runtime,
+            &mut controller,
+        );
+
+        assert_eq!(status.state, ThermalState::Normal);
+        assert!(runtime.sensor_states.is_empty());
+        assert_eq!(readings[0].state, ThermalState::Normal);
+        assert!(events.iter().any(|event| {
+            matches!(event.kind, AlertEventKind::TemperatureCritical)
+                && matches!(event.state, AlertEventState::Resolved)
+                && event.source_label == "CPU"
+        }));
+    }
+
+    #[test]
+    fn thermal_cycle_retries_restore_after_transient_failure() {
+        let settings = default_thermal_settings();
+        let mut runtime = ThermalRuntimeState {
+            sensor_states: HashMap::new(),
+            global_state: ThermalState::Critical,
+            previous_control_state: Some(CapturedControlState::AcerNitro {
+                fan_control: None,
+                operating_mode: Some(1),
+            }),
+            control_applied_by_app: true,
+            last_action: None,
+            last_error: None,
+        };
+        let mut controller = MockThermalController {
+            control_available: true,
+            capture_calls: 0,
+            apply_calls: 0,
+            restore_calls: 0,
+            captured_state: None,
+            apply_result: Ok(CoolingAction::FanMax),
+            restore_result: Err(anyhow!("erreur transitoire")),
+        };
+
+        let mut readings = vec![cpu_temperature(80.0)];
+        let (_, failed_events) = evaluate_thermal_cycle(
+            30,
+            &settings,
+            &mut readings,
+            ThermalCapabilities {
+                source: TemperatureSource::AcerNitro,
+                read_supported: true,
+                control_supported: true,
+                fan_control_supported: true,
+                operating_mode_supported: true,
+            },
+            &mut runtime,
+            &mut controller,
+        );
+
+        assert_eq!(controller.restore_calls, 1);
+        assert!(runtime.control_applied_by_app);
+        assert!(runtime.previous_control_state.is_some());
+        assert!(
+            failed_events
+                .iter()
+                .any(|event| matches!(event.kind, AlertEventKind::CoolingActionFailed))
+        );
+
+        controller.restore_result = Ok(CoolingAction::TurboMode);
+        let mut retry_readings = vec![cpu_temperature(78.0)];
+        let (_, retry_events) = evaluate_thermal_cycle(
+            31,
+            &settings,
+            &mut retry_readings,
+            ThermalCapabilities {
+                source: TemperatureSource::AcerNitro,
+                read_supported: true,
+                control_supported: true,
+                fan_control_supported: true,
+                operating_mode_supported: true,
+            },
+            &mut runtime,
+            &mut controller,
+        );
+
+        assert_eq!(controller.restore_calls, 2);
+        assert!(!runtime.control_applied_by_app);
+        assert!(runtime.previous_control_state.is_none());
+        assert!(
+            retry_events
+                .iter()
+                .any(|event| matches!(event.kind, AlertEventKind::CoolingActionRestored))
         );
     }
 }

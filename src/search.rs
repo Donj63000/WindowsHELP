@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chrono::{NaiveDate, Utc};
@@ -17,7 +17,9 @@ use walkdir::{DirEntry, WalkDir};
 use crate::config::IndexConfig;
 use crate::platform_windows::{is_hidden, is_system, metadata_attributes};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+const MAX_WATCHER_EVENT_PATHS: usize = 256;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub text: String,
     pub extension: Option<String>,
@@ -26,20 +28,6 @@ pub struct SearchQuery {
     pub modified_after: Option<i64>,
     pub modified_before: Option<i64>,
     pub include_hidden: bool,
-}
-
-impl Default for SearchQuery {
-    fn default() -> Self {
-        Self {
-            text: String::new(),
-            extension: None,
-            min_size: None,
-            max_size: None,
-            modified_after: None,
-            modified_before: None,
-            include_hidden: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,6 +77,8 @@ pub struct SearchService {
     runtime: Handle,
     watcher_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
     scan_in_progress: Arc<AtomicBool>,
+    reindex_requested: Arc<AtomicBool>,
+    config_revision: Arc<AtomicU64>,
 }
 
 impl SearchService {
@@ -109,6 +99,8 @@ impl SearchService {
             runtime,
             watcher_stop: Arc::new(Mutex::new(None)),
             scan_in_progress: Arc::new(AtomicBool::new(false)),
+            reindex_requested: Arc::new(AtomicBool::new(false)),
+            config_revision: Arc::new(AtomicU64::new(0)),
         };
 
         service.start_watchers();
@@ -124,15 +116,8 @@ impl SearchService {
         if let Ok(mut guard) = self.config.write() {
             *guard = config;
         }
-        if let Ok(mut snapshot_guard) = self.snapshot.write() {
-            snapshot_guard.clear();
-        }
-        if let Ok(mut status_guard) = self.status.lock() {
-            status_guard.indexed_entries = 0;
-            status_guard.last_error = None;
-            status_guard.snapshot_loaded = true;
-            status_guard.snapshot_revision = status_guard.snapshot_revision.wrapping_add(1);
-        }
+        self.config_revision.fetch_add(1, Ordering::SeqCst);
+        reset_snapshot_before_reindex(&self.snapshot, &self.status);
         self.start_watchers();
         self.reindex_now();
     }
@@ -141,17 +126,11 @@ impl SearchService {
         self.config
             .read()
             .map(|config| config.clone())
-            .unwrap_or_else(|_| IndexConfig {
-                roots: Vec::new(),
-                exclusions: Vec::new(),
-                include_hidden: false,
-                include_system: false,
-                scan_concurrency: 1,
-                db_path: PathBuf::new(),
-            })
+            .unwrap_or_else(|_| fallback_index_config())
     }
 
     pub fn reindex_now(&self) {
+        self.reindex_requested.store(true, Ordering::SeqCst);
         if self
             .scan_in_progress
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -160,48 +139,98 @@ impl SearchService {
             return;
         }
 
-        let config = self.config();
+        let config_lock = Arc::clone(&self.config);
         let snapshot = Arc::clone(&self.snapshot);
         let status = Arc::clone(&self.status);
         let scan_flag = Arc::clone(&self.scan_in_progress);
+        let reindex_requested = Arc::clone(&self.reindex_requested);
+        let config_revision = Arc::clone(&self.config_revision);
         self.runtime.spawn(async move {
-            {
-                if let Ok(mut guard) = status.lock() {
-                    guard.is_indexing = true;
-                    guard.last_error = None;
-                    guard.last_scan_started = Some(Utc::now().timestamp());
-                }
-            }
+            loop {
+                reindex_requested.store(false, Ordering::SeqCst);
+                let config = config_lock
+                    .read()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_else(|_| fallback_index_config());
+                let scan_revision = config_revision.load(Ordering::SeqCst);
 
-            let db_path = config.db_path.clone();
-            let result = tokio::task::spawn_blocking(move || full_scan(&config)).await;
-            match result {
-                Ok(Ok(_)) => {
-                    let reload_result =
-                        tokio::task::spawn_blocking(move || load_snapshot(&db_path)).await;
-                    match reload_result {
-                        Ok(Ok(items)) => {
-                            apply_snapshot(
-                                &snapshot,
-                                &status,
-                                items,
-                                Some(Utc::now().timestamp()),
-                            );
-                        }
-                        Ok(Err(error)) => set_status_error(&status, error.to_string(), true),
-                        Err(join_error) => {
-                            set_status_error(&status, join_error.to_string(), true);
-                        }
+                {
+                    if let Ok(mut guard) = status.lock() {
+                        guard.is_indexing = true;
+                        guard.last_error = None;
+                        guard.last_scan_started = Some(Utc::now().timestamp());
                     }
                 }
-                Ok(Err(error)) => {
-                    set_status_error(&status, error.to_string(), true);
+
+                let db_path = config.db_path.clone();
+                let result = tokio::task::spawn_blocking(move || full_scan(&config)).await;
+                match result {
+                    Ok(Ok(_)) => {
+                        let reload_result =
+                            tokio::task::spawn_blocking(move || load_snapshot(&db_path)).await;
+                        match reload_result {
+                            Ok(Ok(items)) => {
+                                apply_snapshot_if_current(
+                                    &snapshot,
+                                    &status,
+                                    items,
+                                    Some(Utc::now().timestamp()),
+                                    &config_revision,
+                                    scan_revision,
+                                );
+                            }
+                            Ok(Err(error)) => {
+                                set_status_error_if_current(
+                                    &status,
+                                    error.to_string(),
+                                    true,
+                                    &config_revision,
+                                    scan_revision,
+                                );
+                            }
+                            Err(join_error) => {
+                                set_status_error_if_current(
+                                    &status,
+                                    join_error.to_string(),
+                                    true,
+                                    &config_revision,
+                                    scan_revision,
+                                );
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        set_status_error_if_current(
+                            &status,
+                            error.to_string(),
+                            true,
+                            &config_revision,
+                            scan_revision,
+                        );
+                    }
+                    Err(join_error) => {
+                        set_status_error_if_current(
+                            &status,
+                            join_error.to_string(),
+                            true,
+                            &config_revision,
+                            scan_revision,
+                        );
+                    }
                 }
-                Err(join_error) => {
-                    set_status_error(&status, join_error.to_string(), true);
+
+                if !reindex_requested.load(Ordering::SeqCst) {
+                    scan_flag.store(false, Ordering::SeqCst);
+                    if reindex_requested.swap(false, Ordering::SeqCst)
+                        && scan_flag
+                            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                    {
+                        continue;
+                    }
+                    break;
                 }
             }
-            scan_flag.store(false, Ordering::SeqCst);
         });
     }
 
@@ -230,10 +259,10 @@ impl SearchService {
         let config = self.config();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
-        if let Ok(mut watcher_guard) = self.watcher_stop.lock() {
-            if let Some(existing) = watcher_guard.replace(Arc::clone(&stop_flag)) {
-                existing.store(true, Ordering::SeqCst);
-            }
+        if let Ok(mut watcher_guard) = self.watcher_stop.lock()
+            && let Some(existing) = watcher_guard.replace(Arc::clone(&stop_flag))
+        {
+            existing.store(true, Ordering::SeqCst);
         }
 
         if let Ok(mut status_guard) = self.status.lock() {
@@ -244,6 +273,7 @@ impl SearchService {
         let status = Arc::clone(&self.status);
         let snapshot = Arc::clone(&self.snapshot);
         let config_lock = Arc::clone(&self.config);
+        let config_revision = Arc::clone(&self.config_revision);
 
         thread::spawn(move || {
             let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
@@ -260,22 +290,26 @@ impl SearchService {
             };
 
             for root in &config.roots {
-                if root.exists() && watcher.watch(root, RecursiveMode::Recursive).is_err() {
-                    if let Ok(mut guard) = status.lock() {
-                        guard.last_error =
-                            Some(format!("Échec de la surveillance de {}", root.display()));
-                    }
+                if root.exists()
+                    && watcher.watch(root, RecursiveMode::Recursive).is_err()
+                    && let Ok(mut guard) = status.lock()
+                {
+                    guard.last_error =
+                        Some(format!("Échec de la surveillance de {}", root.display()));
                 }
             }
 
             keep_watcher_alive(
                 &mut watcher,
                 rx,
-                runtime,
-                config_lock,
-                snapshot,
-                status,
-                stop_flag,
+                WatcherRuntime {
+                    runtime,
+                    config_lock,
+                    snapshot,
+                    status,
+                    config_revision,
+                    stop_flag,
+                },
             );
         });
     }
@@ -284,35 +318,108 @@ impl SearchService {
         let db_path = self.config().db_path;
         let snapshot = Arc::clone(&self.snapshot);
         let status = Arc::clone(&self.status);
+        let config_revision = Arc::clone(&self.config_revision);
+        let snapshot_revision = config_revision.load(Ordering::SeqCst);
         self.runtime.spawn(async move {
             let result = tokio::task::spawn_blocking(move || load_snapshot(&db_path)).await;
             match result {
-                Ok(Ok(items)) => apply_snapshot(&snapshot, &status, items, None),
-                Ok(Err(error)) => set_status_error(&status, error.to_string(), false),
-                Err(join_error) => set_status_error(&status, join_error.to_string(), false),
+                Ok(Ok(items)) => {
+                    apply_snapshot_if_current(
+                        &snapshot,
+                        &status,
+                        items,
+                        None,
+                        &config_revision,
+                        snapshot_revision,
+                    );
+                }
+                Ok(Err(error)) => {
+                    set_status_error_if_current(
+                        &status,
+                        error.to_string(),
+                        false,
+                        &config_revision,
+                        snapshot_revision,
+                    );
+                }
+                Err(join_error) => {
+                    set_status_error_if_current(
+                        &status,
+                        join_error.to_string(),
+                        false,
+                        &config_revision,
+                        snapshot_revision,
+                    );
+                }
             }
         });
     }
 }
 
-fn keep_watcher_alive(
-    _watcher: &mut RecommendedWatcher,
-    rx: mpsc::Receiver<notify::Result<Event>>,
+fn fallback_index_config() -> IndexConfig {
+    IndexConfig {
+        roots: Vec::new(),
+        exclusions: Vec::new(),
+        include_hidden: false,
+        include_system: false,
+        scan_concurrency: 1,
+        db_path: PathBuf::new(),
+    }
+}
+
+impl Drop for SearchService {
+    fn drop(&mut self) {
+        stop_current_watcher(&self.watcher_stop);
+    }
+}
+
+struct WatcherRuntime {
     runtime: Handle,
     config_lock: Arc<RwLock<IndexConfig>>,
     snapshot: Arc<RwLock<Vec<IndexedEntry>>>,
     status: Arc<Mutex<IndexStatus>>,
+    config_revision: Arc<AtomicU64>,
     stop_flag: Arc<AtomicBool>,
+}
+
+fn keep_watcher_alive(
+    _watcher: &mut RecommendedWatcher,
+    rx: mpsc::Receiver<notify::Result<Event>>,
+    context: WatcherRuntime,
 ) {
-    while !stop_flag.load(Ordering::SeqCst) {
+    while !context.stop_flag.load(Ordering::SeqCst) {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Ok(event)) => {
-                let paths = event.paths.clone();
-                let config = config_lock.read().map(|guard| guard.clone());
+                let mut paths = event.paths.clone();
+                let debounce_until = Instant::now() + Duration::from_millis(350);
+                while !context.stop_flag.load(Ordering::SeqCst) {
+                    let remaining = debounce_until.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match rx.recv_timeout(remaining.min(Duration::from_millis(50))) {
+                        Ok(Ok(event)) => paths.extend(event.paths),
+                        Ok(Err(error)) => {
+                            if let Ok(mut guard) = context.status.lock() {
+                                guard.last_error =
+                                    Some(format!("Erreur de surveillance : {error}"));
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                let config = context.config_lock.read().map(|guard| guard.clone());
                 if let Ok(config) = config {
-                    let snapshot = Arc::clone(&snapshot);
-                    let status = Arc::clone(&status);
-                    runtime.spawn(async move {
+                    let paths = coalesce_changed_paths(paths, &config.roots);
+                    if paths.is_empty() {
+                        continue;
+                    }
+                    let event_revision = context.config_revision.load(Ordering::SeqCst);
+                    let snapshot = Arc::clone(&context.snapshot);
+                    let status = Arc::clone(&context.status);
+                    let config_revision = Arc::clone(&context.config_revision);
+                    context.runtime.spawn(async move {
                         let db_path = config.db_path.clone();
                         let result =
                             tokio::task::spawn_blocking(move || sync_paths(&config, &paths)).await;
@@ -320,22 +427,49 @@ fn keep_watcher_alive(
                             let reload_result =
                                 tokio::task::spawn_blocking(move || load_snapshot(&db_path)).await;
                             match reload_result {
-                                Ok(Ok(items)) => apply_snapshot(&snapshot, &status, items, None),
+                                Ok(Ok(items)) => {
+                                    apply_snapshot_if_current(
+                                        &snapshot,
+                                        &status,
+                                        items,
+                                        None,
+                                        &config_revision,
+                                        event_revision,
+                                    );
+                                }
                                 Ok(Err(error)) => {
-                                    set_status_error(&status, error.to_string(), false);
+                                    set_status_error_if_current(
+                                        &status,
+                                        error.to_string(),
+                                        false,
+                                        &config_revision,
+                                        event_revision,
+                                    );
                                 }
                                 Err(join_error) => {
-                                    set_status_error(&status, join_error.to_string(), false);
+                                    set_status_error_if_current(
+                                        &status,
+                                        join_error.to_string(),
+                                        false,
+                                        &config_revision,
+                                        event_revision,
+                                    );
                                 }
                             }
                         } else if let Ok(Err(error)) = result {
-                            set_status_error(&status, error.to_string(), false);
+                            set_status_error_if_current(
+                                &status,
+                                error.to_string(),
+                                false,
+                                &config_revision,
+                                event_revision,
+                            );
                         }
                     });
                 }
             }
             Ok(Err(error)) => {
-                if let Ok(mut guard) = status.lock() {
+                if let Ok(mut guard) = context.status.lock() {
                     guard.last_error = Some(format!("Erreur de surveillance : {error}"));
                 }
             }
@@ -343,6 +477,54 @@ fn keep_watcher_alive(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+fn stop_current_watcher(watcher_stop: &Arc<Mutex<Option<Arc<AtomicBool>>>>) -> bool {
+    watcher_stop
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+        .map(|stop_flag| {
+            stop_flag.store(true, Ordering::SeqCst);
+            true
+        })
+        .unwrap_or(false)
+}
+
+fn coalesce_changed_paths(paths: Vec<PathBuf>, roots: &[PathBuf]) -> Vec<PathBuf> {
+    let root_prefixes = roots
+        .iter()
+        .map(|root| normalized_path_string(root).to_lowercase())
+        .collect::<Vec<_>>();
+    let mut unique = paths
+        .into_iter()
+        .filter_map(|path| {
+            let normalized = normalized_path_string(&path).to_lowercase();
+            if !root_prefixes.is_empty() && !path_is_under_any_root(&normalized, &root_prefixes) {
+                return None;
+            }
+            Some((normalized, path))
+        })
+        .collect::<Vec<_>>();
+
+    unique.sort_by(|left, right| left.0.cmp(&right.0));
+    unique.dedup_by(|left, right| left.0 == right.0);
+
+    let mut coalesced: Vec<(String, PathBuf)> = Vec::new();
+    for (normalized, path) in unique {
+        if coalesced
+            .iter()
+            .any(|(ancestor, _)| path_is_under_root(&normalized, ancestor))
+        {
+            continue;
+        }
+        coalesced.push((normalized, path));
+        if coalesced.len() >= MAX_WATCHER_EVENT_PATHS {
+            break;
+        }
+    }
+
+    coalesced.into_iter().map(|(_, path)| path).collect()
 }
 
 pub fn initialize_database(path: &Path) -> anyhow::Result<()> {
@@ -412,6 +594,36 @@ fn apply_snapshot(
     }
 }
 
+fn apply_snapshot_if_current(
+    snapshot: &Arc<RwLock<Vec<IndexedEntry>>>,
+    status: &Arc<Mutex<IndexStatus>>,
+    items: Vec<IndexedEntry>,
+    completed_at: Option<i64>,
+    config_revision: &AtomicU64,
+    expected_revision: u64,
+) -> bool {
+    if config_revision.load(Ordering::SeqCst) != expected_revision {
+        return false;
+    }
+    apply_snapshot(snapshot, status, items, completed_at);
+    true
+}
+
+fn reset_snapshot_before_reindex(
+    snapshot: &Arc<RwLock<Vec<IndexedEntry>>>,
+    status: &Arc<Mutex<IndexStatus>>,
+) {
+    if let Ok(mut snapshot_guard) = snapshot.write() {
+        snapshot_guard.clear();
+    }
+    if let Ok(mut status_guard) = status.lock() {
+        status_guard.indexed_entries = 0;
+        status_guard.last_error = None;
+        status_guard.snapshot_loaded = false;
+        status_guard.snapshot_revision = status_guard.snapshot_revision.wrapping_add(1);
+    }
+}
+
 fn set_status_error(status: &Arc<Mutex<IndexStatus>>, error: String, clear_indexing: bool) {
     if let Ok(mut status_guard) = status.lock() {
         status_guard.last_error = Some(error);
@@ -421,16 +633,32 @@ fn set_status_error(status: &Arc<Mutex<IndexStatus>>, error: String, clear_index
     }
 }
 
+fn set_status_error_if_current(
+    status: &Arc<Mutex<IndexStatus>>,
+    error: String,
+    clear_indexing: bool,
+    config_revision: &AtomicU64,
+    expected_revision: u64,
+) -> bool {
+    if config_revision.load(Ordering::SeqCst) != expected_revision {
+        return false;
+    }
+    set_status_error(status, error, clear_indexing);
+    true
+}
+
 pub fn full_scan(config: &IndexConfig) -> anyhow::Result<usize> {
     initialize_database(&config.db_path)?;
     let mut connection = open_connection(&config.db_path)?;
     let mut indexed_entries = 0usize;
+    let active_roots = config
+        .roots
+        .iter()
+        .filter(|root| root.exists())
+        .cloned()
+        .collect::<Vec<_>>();
 
-    for root in &config.roots {
-        if !root.exists() {
-            continue;
-        }
-
+    for root in &active_roots {
         let existing = existing_paths_under_root(&connection, root)?;
         let mut seen = HashSet::new();
         let transaction = connection.transaction()?;
@@ -479,6 +707,7 @@ pub fn full_scan(config: &IndexConfig) -> anyhow::Result<usize> {
         let missing: Vec<String> = existing.difference(&seen).cloned().collect();
         delete_paths(&mut connection, &missing)?;
     }
+    delete_paths_outside_roots(&mut connection, &active_roots)?;
 
     Ok(indexed_entries)
 }
@@ -487,6 +716,7 @@ pub fn sync_paths(config: &IndexConfig, paths: &[PathBuf]) -> anyhow::Result<()>
     initialize_database(&config.db_path)?;
     let mut connection = open_connection(&config.db_path)?;
     let transaction = connection.transaction()?;
+    let paths = coalesce_changed_paths(paths.to_vec(), &config.roots);
     {
         let mut statement = transaction.prepare(
             "
@@ -509,7 +739,7 @@ pub fn sync_paths(config: &IndexConfig, paths: &[PathBuf]) -> anyhow::Result<()>
             ",
         )?;
 
-        for path in paths {
+        for path in &paths {
             sync_single_path(&transaction, &mut statement, config, path)?;
         }
     }
@@ -632,9 +862,8 @@ fn existing_paths_under_prefix(
     connection: &Connection,
     prefix: &str,
 ) -> anyhow::Result<HashSet<String>> {
-    let mut statement = connection.prepare(
-        "SELECT path FROM file_index WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'",
-    )?;
+    let mut statement = connection
+        .prepare("SELECT path FROM file_index WHERE path = ?1 OR path LIKE ?2 ESCAPE '\\'")?;
     let like = child_prefix_like(prefix);
     let rows = statement.query_map(params![prefix, like], |row| row.get::<_, String>(0))?;
 
@@ -658,6 +887,31 @@ fn delete_paths(connection: &mut Connection, paths: &[String]) -> anyhow::Result
     }
     transaction.commit()?;
     Ok(())
+}
+
+fn delete_paths_outside_roots(
+    connection: &mut Connection,
+    roots: &[PathBuf],
+) -> anyhow::Result<()> {
+    let root_prefixes = roots
+        .iter()
+        .map(|root| normalized_path_string(root).to_lowercase())
+        .collect::<Vec<_>>();
+    let stale_paths = {
+        let mut statement = connection.prepare("SELECT path, path_lower FROM file_index")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut stale_paths = Vec::new();
+        for row in rows {
+            let (path, path_lower) = row?;
+            if !path_is_under_any_root(&path_lower, &root_prefixes) {
+                stale_paths.push(path);
+            }
+        }
+        stale_paths
+    };
+    delete_paths(connection, &stale_paths)
 }
 
 fn remove_path_prefix(connection: &Connection, path: &Path) -> anyhow::Result<()> {
@@ -716,11 +970,11 @@ fn entry_to_indexed_entry(path: &Path, config: &IndexConfig) -> anyhow::Result<I
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase());
+        .map(str::to_lowercase);
     let path_str = normalized_path_string(path);
     Ok(IndexedEntry {
-        path_lower: path_str.to_ascii_lowercase(),
-        name_lower: name.to_ascii_lowercase(),
+        path_lower: path_str.to_lowercase(),
+        name_lower: name.to_lowercase(),
         path: path_str,
         name,
         extension,
@@ -750,42 +1004,58 @@ pub fn search_snapshot(
         })
         .filter(|extension| !extension.is_empty());
 
-    let mut results: Vec<SearchResult> = snapshot
-        .iter()
-        .filter_map(|entry| {
-            if !matches_query(
-                entry,
-                query,
-                normalized_text.as_deref(),
-                normalized_extension.as_deref(),
-            ) {
-                return None;
-            }
-            Some(SearchResult {
-                score: score_entry(entry, normalized_text.as_deref()),
-                item_type: if entry.is_dir {
-                    SearchItemType::Directory
-                } else {
-                    SearchItemType::File
-                },
-                entry: entry.clone(),
-            })
-        })
-        .collect();
+    if limit == 0 {
+        return Vec::new();
+    }
 
-    results.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.entry.name.cmp(&right.entry.name))
-            .then_with(|| left.entry.path.cmp(&right.entry.path))
-    });
-    results.truncate(limit);
+    let mut results = Vec::<SearchResult>::with_capacity(limit.min(200));
+    for entry in snapshot {
+        if !matches_query(
+            entry,
+            query,
+            normalized_text.as_deref(),
+            normalized_extension.as_deref(),
+        ) {
+            continue;
+        }
+
+        let candidate = SearchResult {
+            score: score_entry(entry, normalized_text.as_deref()),
+            item_type: if entry.is_dir {
+                SearchItemType::Directory
+            } else {
+                SearchItemType::File
+            },
+            entry: entry.clone(),
+        };
+
+        if results.len() < limit {
+            results.push(candidate);
+            results.sort_by(compare_search_results);
+        } else if results
+            .last()
+            .map(|worst| compare_search_results(&candidate, worst).is_lt())
+            .unwrap_or(true)
+        {
+            results.pop();
+            results.push(candidate);
+            results.sort_by(compare_search_results);
+        }
+    }
+
     results
 }
 
+fn compare_search_results(left: &SearchResult, right: &SearchResult) -> std::cmp::Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| left.entry.name.cmp(&right.entry.name))
+        .then_with(|| left.entry.path.cmp(&right.entry.path))
+}
+
 pub fn normalize_query_text(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_lowercase();
+    let normalized = value.trim().to_lowercase();
     if normalized.is_empty() {
         None
     } else {
@@ -874,6 +1144,25 @@ fn normalized_path_string(path: &Path) -> String {
     path.to_string_lossy().replace('/', "\\")
 }
 
+fn path_is_under_any_root(path_lower: &str, root_prefixes: &[String]) -> bool {
+    root_prefixes
+        .iter()
+        .any(|root| path_is_under_root(path_lower, root))
+}
+
+fn path_is_under_root(path_lower: &str, root_lower: &str) -> bool {
+    if path_lower == root_lower {
+        return true;
+    }
+    if root_lower.ends_with('\\') {
+        return path_lower.starts_with(root_lower);
+    }
+    path_lower
+        .strip_prefix(root_lower)
+        .map(|remaining| remaining.starts_with('\\'))
+        .unwrap_or(false)
+}
+
 fn system_time_to_unix(time: std::time::SystemTime) -> Option<i64> {
     time.duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -891,7 +1180,6 @@ fn child_prefix_like(prefix: &str) -> String {
         format!("{escaped}\\\\%")
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -914,8 +1202,8 @@ mod tests {
         IndexedEntry {
             path: path.to_owned(),
             name: name.to_owned(),
-            path_lower: path.to_ascii_lowercase(),
-            name_lower: name.to_ascii_lowercase(),
+            path_lower: path.to_lowercase(),
+            name_lower: name.to_lowercase(),
             extension: Some("txt".to_owned()),
             is_dir: false,
             size_bytes: 128,
@@ -929,6 +1217,7 @@ mod tests {
     #[test]
     fn query_normalization_trims_and_lowercases() {
         assert_eq!(normalize_query_text("  Foo Bar "), Some("foo bar".into()));
+        assert_eq!(normalize_query_text("  École "), Some("école".into()));
         assert_eq!(normalize_query_text("   "), None);
     }
 
@@ -940,6 +1229,28 @@ mod tests {
 
         assert!(score_entry(&prefix, Some("rep")) > score_entry(&contains, Some("rep")));
         assert!(score_entry(&contains, Some("rep")) > score_entry(&path_only, Some("rep")));
+    }
+
+    #[test]
+    fn search_snapshot_keeps_bounded_top_results_in_score_order() {
+        let snapshot = vec![
+            sample_entry("yearly-report.txt", "C:\\logs\\yearly-report.txt"),
+            sample_entry("report.txt", "C:\\logs\\report.txt"),
+            sample_entry("archive.txt", "C:\\reports\\archive.txt"),
+            sample_entry("report-final.txt", "C:\\logs\\report-final.txt"),
+        ];
+        let query = SearchQuery {
+            text: "rep".into(),
+            include_hidden: true,
+            ..SearchQuery::default()
+        };
+
+        let results = search_snapshot(&snapshot, &query, 2);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].entry.name, "report.txt");
+        assert_eq!(results[1].entry.name, "report-final.txt");
+        assert!(results[0].score >= results[1].score);
     }
 
     #[test]
@@ -993,6 +1304,95 @@ mod tests {
     }
 
     #[test]
+    fn changed_paths_are_deduplicated_bounded_and_pruned_to_roots() {
+        let root = PathBuf::from(r"C:\Data");
+        let paths = vec![
+            PathBuf::from(r"C:\Data\folder\child.txt"),
+            PathBuf::from(r"C:\Data\folder"),
+            PathBuf::from(r"C:\Data\FOLDER"),
+            PathBuf::from(r"C:\Outside\ignored.txt"),
+        ];
+
+        let coalesced = coalesce_changed_paths(paths, &[root]);
+
+        assert_eq!(coalesced.len(), 1);
+        assert_eq!(
+            normalized_path_string(&coalesced[0]).to_lowercase(),
+            r"c:\data\folder"
+        );
+    }
+
+    #[test]
+    fn reset_snapshot_before_reindex_marks_snapshot_unloaded() {
+        let snapshot = Arc::new(RwLock::new(vec![sample_entry(
+            "alpha.txt",
+            r"C:\Users\alpha.txt",
+        )]));
+        let status = Arc::new(Mutex::new(IndexStatus {
+            indexed_entries: 1,
+            last_error: Some("ancien probleme".into()),
+            snapshot_revision: 7,
+            snapshot_loaded: true,
+            ..IndexStatus::default()
+        }));
+
+        reset_snapshot_before_reindex(&snapshot, &status);
+
+        assert!(snapshot.read().unwrap().is_empty());
+        let status = status.lock().unwrap();
+        assert_eq!(status.indexed_entries, 0);
+        assert!(status.last_error.is_none());
+        assert!(!status.snapshot_loaded);
+        assert_eq!(status.snapshot_revision, 8);
+    }
+
+    #[test]
+    fn stale_snapshot_and_errors_do_not_override_current_revision() {
+        let snapshot = Arc::new(RwLock::new(vec![sample_entry(
+            "current.txt",
+            r"C:\Users\current.txt",
+        )]));
+        let status = Arc::new(Mutex::new(IndexStatus {
+            indexed_entries: 1,
+            snapshot_loaded: true,
+            ..IndexStatus::default()
+        }));
+        let config_revision = AtomicU64::new(2);
+
+        let applied = apply_snapshot_if_current(
+            &snapshot,
+            &status,
+            vec![sample_entry("old.txt", r"C:\Users\old.txt")],
+            Some(100),
+            &config_revision,
+            1,
+        );
+        assert!(!applied);
+        assert_eq!(snapshot.read().unwrap()[0].name, "current.txt");
+
+        let error_applied = set_status_error_if_current(
+            &status,
+            "ancienne erreur".into(),
+            true,
+            &config_revision,
+            1,
+        );
+        assert!(!error_applied);
+        assert!(status.lock().unwrap().last_error.is_none());
+    }
+
+    #[test]
+    fn stop_current_watcher_signals_thread_shutdown() {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let watcher_stop = Arc::new(Mutex::new(Some(Arc::clone(&stop_flag))));
+
+        assert!(stop_current_watcher(&watcher_stop));
+        assert!(stop_flag.load(Ordering::SeqCst));
+        assert!(watcher_stop.lock().unwrap().is_none());
+        assert!(!stop_current_watcher(&watcher_stop));
+    }
+
+    #[test]
     fn full_scan_builds_db_and_sync_updates_it() -> anyhow::Result<()> {
         let temp = tempdir()?;
         let root = temp.path().join("scan-root");
@@ -1016,6 +1416,50 @@ mod tests {
         let snapshot = load_snapshot(&db_path)?;
         assert!(!snapshot.iter().any(|entry| entry.name == "alpha.txt"));
         assert!(snapshot.iter().any(|entry| entry.name == "gamma.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn full_scan_removes_entries_outside_active_roots() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let first_root = temp.path().join("first-root");
+        let second_root = temp.path().join("second-root");
+        let db_path = temp.path().join("index.db");
+        fs::create_dir_all(&first_root)?;
+        fs::create_dir_all(&second_root)?;
+        fs::write(first_root.join("alpha.txt"), "alpha")?;
+        fs::write(second_root.join("beta.txt"), "beta")?;
+
+        let mut config = test_config(&first_root, &db_path);
+        config.roots.push(second_root.clone());
+        full_scan(&config)?;
+        let snapshot = load_snapshot(&db_path)?;
+        assert!(snapshot.iter().any(|entry| entry.name == "alpha.txt"));
+        assert!(snapshot.iter().any(|entry| entry.name == "beta.txt"));
+
+        config.roots = vec![second_root];
+        full_scan(&config)?;
+        let snapshot = load_snapshot(&db_path)?;
+        assert!(!snapshot.iter().any(|entry| entry.name == "alpha.txt"));
+        assert!(snapshot.iter().any(|entry| entry.name == "beta.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn full_scan_clears_index_when_no_configured_root_is_active() -> anyhow::Result<()> {
+        let temp = tempdir()?;
+        let root = temp.path().join("scan-root");
+        let db_path = temp.path().join("index.db");
+        fs::create_dir_all(&root)?;
+        fs::write(root.join("alpha.txt"), "alpha")?;
+
+        let config = test_config(&root, &db_path);
+        full_scan(&config)?;
+        assert!(!load_snapshot(&db_path)?.is_empty());
+
+        fs::remove_dir_all(&root)?;
+        full_scan(&config)?;
+        assert!(load_snapshot(&db_path)?.is_empty());
         Ok(())
     }
 }

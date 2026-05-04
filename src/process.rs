@@ -284,6 +284,10 @@ impl ProcessManager {
             .unwrap_or_default()
     }
 
+    pub fn shared_state(&self) -> Arc<RwLock<ProcessState>> {
+        Arc::clone(&self.state)
+    }
+
     pub fn last_error(&self) -> Option<String> {
         self.state
             .read()
@@ -303,14 +307,15 @@ impl ProcessManager {
         action: ProcessAction,
     ) -> anyhow::Result<ProcessActionResult> {
         validate_process_key(key)?;
+        self.validate_action_policy(key, &action)?;
         match action {
             ProcessAction::CloseGracefully => {
                 close_process_gracefully(key.pid)?;
-                if wait_for_process_exit(key.pid, CLOSE_WAIT_TIMEOUT_MS)? {
-                    Ok(ProcessActionResult::ClosedGracefully)
-                } else {
-                    Ok(ProcessActionResult::CloseRequested)
-                }
+                close_result_from_wait_outcome(
+                    key.pid,
+                    wait_for_process_exit(key.pid, CLOSE_WAIT_TIMEOUT_MS),
+                    process_exists,
+                )
             }
             ProcessAction::Kill => {
                 kill_process(key.pid)?;
@@ -323,15 +328,26 @@ impl ProcessManager {
         }
     }
 
+    fn validate_action_policy(
+        &self,
+        key: &ProcessKey,
+        action: &ProcessAction,
+    ) -> anyhow::Result<()> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| anyhow::anyhow!("etat courant des processus indisponible"))?;
+        validate_process_action_from_state(&state, key, action)
+    }
+
     fn spawn_refresh_loop(&self, runtime: Handle) {
         let state = Arc::clone(&self.state);
         let refresh_interval = Arc::clone(&self.refresh_interval);
 
         runtime.spawn(async move {
-            let mut system = System::new_all();
+            let mut system = System::new();
             let mut context = ProcessRefreshContext::default();
             let mut revision = 0u64;
-            system.refresh_all();
 
             loop {
                 revision = revision.saturating_add(1);
@@ -544,8 +560,11 @@ fn compare_rows(left: &ProcessRow, right: &ProcessRow) -> Ordering {
                 .partial_cmp(&left.cpu_now)
                 .unwrap_or(Ordering::Equal)
         })
+        .then_with(|| left.name.cmp(&right.name))
+        .then_with(|| left.key.pid.cmp(&right.key.pid))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_process_insight(
     name: &str,
     path: Option<&Path>,
@@ -644,6 +663,7 @@ fn impact_score(
         .round() as u8
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_reasons(
     name: &str,
     path: Option<&Path>,
@@ -898,10 +918,7 @@ fn build_recommendations(
         .collect()
 }
 
-fn pick_primary_suspect<'a>(
-    rows: &'a [ProcessRow],
-    bottleneck: ProcessBottleneck,
-) -> Option<&'a ProcessRow> {
+fn pick_primary_suspect(rows: &[ProcessRow], bottleneck: ProcessBottleneck) -> Option<&ProcessRow> {
     match bottleneck {
         ProcessBottleneck::Cpu => rows.iter().find(|row| row.insight.cpu_avg_10s >= 10.0),
         ProcessBottleneck::Memory => rows.iter().find(|row| row.insight.memory_percent >= 5.0),
@@ -1078,14 +1095,16 @@ fn average_cpu_over(history: &VecDeque<ProcessSample>, window: Duration) -> f32 
         .captured_at
         .checked_sub(window)
         .unwrap_or(last.captured_at);
-    let relevant = history
-        .iter()
-        .filter(|sample| sample.captured_at >= cutoff)
-        .collect::<Vec<_>>();
-    if relevant.is_empty() {
+    let mut total = 0.0;
+    let mut count = 0usize;
+    for sample in history.iter().filter(|sample| sample.captured_at >= cutoff) {
+        total += sample.cpu_now;
+        count += 1;
+    }
+    if count == 0 {
         0.0
     } else {
-        relevant.iter().map(|sample| sample.cpu_now).sum::<f32>() / relevant.len() as f32
+        total / count as f32
     }
 }
 
@@ -1097,18 +1116,16 @@ fn average_memory_over(history: &VecDeque<ProcessSample>, window: Duration) -> f
         .captured_at
         .checked_sub(window)
         .unwrap_or(last.captured_at);
-    let relevant = history
-        .iter()
-        .filter(|sample| sample.captured_at >= cutoff)
-        .collect::<Vec<_>>();
-    if relevant.is_empty() {
+    let mut total = 0u128;
+    let mut count = 0usize;
+    for sample in history.iter().filter(|sample| sample.captured_at >= cutoff) {
+        total += u128::from(sample.memory_bytes);
+        count += 1;
+    }
+    if count == 0 {
         0.0
     } else {
-        relevant
-            .iter()
-            .map(|sample| sample.memory_bytes as f64)
-            .sum::<f64>()
-            / relevant.len() as f64
+        total as f64 / count as f64
     }
 }
 
@@ -1220,6 +1237,69 @@ fn validate_process_key(key: &ProcessKey) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_process_action_policy(row: &ProcessRow, action: &ProcessAction) -> anyhow::Result<()> {
+    if matches!(
+        row.insight.safety,
+        ProcessSafety::CriticalSystem | ProcessSafety::WindowsComponent
+    ) {
+        let action_label = match action {
+            ProcessAction::CloseGracefully => "fermeture",
+            ProcessAction::Kill => "terminaison",
+            ProcessAction::SetPriority(_) => "changement de priorite",
+        };
+        anyhow::bail!(
+            "{action_label} bloque sur {} ({}) car le processus est protege ({})",
+            row.name,
+            row.key.pid,
+            row.insight.safety.label()
+        );
+    }
+    Ok(())
+}
+
+fn validate_process_action_from_state(
+    state: &ProcessState,
+    key: &ProcessKey,
+    action: &ProcessAction,
+) -> anyhow::Result<()> {
+    let row = state
+        .rows
+        .iter()
+        .find(|row| &row.key == key)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "action annulee: le processus {} n'est plus dans l'instantane courant",
+                key.pid
+            )
+        })?;
+    validate_process_action_policy(row, action)
+}
+
+fn close_result_from_wait_outcome(
+    pid: u32,
+    wait_result: anyhow::Result<bool>,
+    process_exists: impl FnOnce(u32) -> bool,
+) -> anyhow::Result<ProcessActionResult> {
+    match wait_result {
+        Ok(true) => Ok(ProcessActionResult::ClosedGracefully),
+        Ok(false) => Ok(ProcessActionResult::CloseRequested),
+        Err(error) if !process_exists(pid) => Ok(ProcessActionResult::ClosedGracefully),
+        Err(error) => Err(error),
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    let pid = Pid::from_u32(pid);
+    let pids = [pid];
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&pids),
+        true,
+        ProcessRefreshKind::nothing().with_memory(),
+    );
+    system.process(pid).is_some()
+}
+
 fn translate_process_status(status: ProcessStatus) -> &'static str {
     match status {
         ProcessStatus::Idle => "Inactif",
@@ -1263,6 +1343,37 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
 
+    fn process_row_for_sort(pid: u32, name: &str) -> ProcessRow {
+        ProcessRow {
+            key: ProcessKey {
+                pid,
+                started_at: Some(pid as u64),
+            },
+            family_id: name.to_owned(),
+            name: name.to_owned(),
+            path: None,
+            parent_pid: None,
+            cpu_now: 10.0,
+            memory_bytes: 1024,
+            threads: 1,
+            priority: PriorityClass::Normal,
+            status: "En cours".into(),
+            run_time_secs: 10,
+            has_visible_window: true,
+            insight: ProcessInsight {
+                impact_score: 50,
+                cpu_avg_10s: 10.0,
+                cpu_peak_60s: 10.0,
+                memory_percent: 1.0,
+                disk_io_bytes_per_sec: 0,
+                safety: ProcessSafety::LikelyClosable,
+                suggested_action: SuggestedAction::CloseGracefully,
+                trend: ProcessTrend::Stable,
+                reasons: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn safety_classification_is_conservative() {
         assert_eq!(
@@ -1290,6 +1401,39 @@ mod tests {
     }
 
     #[test]
+    fn process_action_policy_blocks_protected_processes() {
+        let mut protected = process_row_for_sort(4, "csrss.exe");
+        protected.insight.safety = ProcessSafety::CriticalSystem;
+
+        for action in [
+            ProcessAction::CloseGracefully,
+            ProcessAction::Kill,
+            ProcessAction::SetPriority(PriorityClass::BelowNormal),
+        ] {
+            let error = validate_process_action_policy(&protected, &action).unwrap_err();
+            assert!(error.to_string().contains("processus est protege"));
+        }
+
+        let closeable = process_row_for_sort(42, "notepad.exe");
+        validate_process_action_policy(&closeable, &ProcessAction::Kill)
+            .expect("closeable process should pass policy");
+    }
+
+    #[test]
+    fn process_action_policy_fails_closed_without_current_snapshot_row() {
+        let state = ProcessState::default();
+        let key = ProcessKey {
+            pid: 42,
+            started_at: Some(1),
+        };
+
+        let error =
+            validate_process_action_from_state(&state, &key, &ProcessAction::Kill).unwrap_err();
+
+        assert!(error.to_string().contains("instantane courant"));
+    }
+
+    #[test]
     fn history_metrics_compute_trend_and_average() {
         let now = Instant::now();
         let history = VecDeque::from(vec![
@@ -1302,27 +1446,46 @@ mod tests {
             ProcessSample {
                 captured_at: now - Duration::from_secs(6),
                 cpu_now: 7.0,
-                memory_bytes: 10,
+                memory_bytes: 20,
                 disk_total_bytes: 220,
             },
             ProcessSample {
                 captured_at: now - Duration::from_secs(3),
                 cpu_now: 20.0,
-                memory_bytes: 10,
+                memory_bytes: 30,
                 disk_total_bytes: 520,
             },
             ProcessSample {
                 captured_at: now,
                 cpu_now: 25.0,
-                memory_bytes: 10,
+                memory_bytes: 40,
                 disk_total_bytes: 820,
             },
         ]);
 
         let average = average_cpu_over(&history, SHORT_WINDOW);
         assert!((average - 14.25).abs() < f32::EPSILON);
+        assert!((average_memory_over(&history, SHORT_WINDOW) - 25.0).abs() < f64::EPSILON);
         assert_eq!(compute_trend(&history), ProcessTrend::Rising);
         assert!(disk_bytes_per_second(&history) > 0);
+    }
+
+    #[test]
+    fn process_rows_have_deterministic_tie_breakers() {
+        let mut rows = [
+            process_row_for_sort(30, "beta.exe"),
+            process_row_for_sort(20, "alpha.exe"),
+            process_row_for_sort(10, "alpha.exe"),
+        ];
+
+        rows.sort_by(compare_rows);
+
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.name.as_str(), row.key.pid))
+                .collect::<Vec<_>>(),
+            vec![("alpha.exe", 10), ("alpha.exe", 20), ("beta.exe", 30)]
+        );
     }
 
     #[test]
@@ -1393,6 +1556,24 @@ mod tests {
         assert_eq!(families[0].instance_count, 2);
         assert_eq!(families[0].closeable_instances, 1);
         assert_eq!(families[0].top_process, Some(key_a));
+    }
+
+    #[test]
+    fn close_wait_treats_missing_process_as_closed() -> anyhow::Result<()> {
+        let result =
+            close_result_from_wait_outcome(42, Err(anyhow::anyhow!("process disparu")), |_| false)?;
+
+        assert_eq!(result, ProcessActionResult::ClosedGracefully);
+        Ok(())
+    }
+
+    #[test]
+    fn close_wait_keeps_error_when_process_still_exists() {
+        let error =
+            close_result_from_wait_outcome(42, Err(anyhow::anyhow!("acces refuse")), |_| true)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("acces refuse"));
     }
 
     #[test]
